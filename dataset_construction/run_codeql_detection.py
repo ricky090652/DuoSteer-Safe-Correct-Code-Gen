@@ -47,7 +47,7 @@ FORMAT_SCRIPT = Path(__file__).resolve().parent / "format_output_new.py"
 # CWE → list of .ql file paths (relative to QLPACK_BASE)
 CWE_QUERIES = {
     "cwe-022": ["CWE-022/PathInjection.ql", "CWE-022/TarSlip.ql"],
-    "cwe-079": ["CWE-079/ReflectedXss.ql"],
+    "cwe-079": ["CWE-079/ReflectedXss.ql", "CWE-079/Jinja2WithoutEscaping.ql"],
     "cwe-094": ["CWE-094/CodeInjection.ql"],
     "cwe-295": ["CWE-295/MissingHostKeyValidation.ql", "CWE-295/RequestWithoutValidation.ql"],
     "cwe-502": ["CWE-502/UnsafeDeserialization.ql"],
@@ -99,10 +99,11 @@ def run_analysis(codeql, cwe_id, db_dir, query_paths, sarif_out, dry_run):
 def parse_sarif(sarif_path, out_json_path, dry_run, source_dir=None):
     """Convert SARIF to structured JSON via format_output_new.py.
 
-    source_dir: when provided (and cwe is not cwe-079), passes --source_dir to
-    filter findings whose startLine falls inside the CodeQL entry-point wrapper.
-    cwe-079 must NOT use this filter: its XSS sink (make_response) is inside the
-    wrapper by design, so filtering would remove all valid detections.
+    source_dir: when provided, passes --source_dir to filter findings whose
+    startLine falls inside the CodeQL entry-point wrapper, for EVERY CWE. Since
+    wrapper v4 the CWE-079 wrapper is source-only (it feeds request.args into the
+    function but never renders the return value), so an XSS finding must come
+    from an html sink inside the generated code and the filter applies to 079 too.
     """
     print(f"  Parsing SARIF -> {out_json_path}")
     if dry_run:
@@ -196,11 +197,9 @@ def process_cwe(codeql, cwe_id, source_base, db_base, out_base, run_all_suite, d
     # Step 1: build database (shared by both analyses)
     build_database(codeql, cwe_id, source_dir, db_dir, dry_run)
 
-    # cwe-079: do NOT pass source_dir — XSS sink (make_response) is in the wrapper
-    # by design; filtering would remove all valid detections. CodeQL's sanitizer
-    # recognition (html.escape etc.) handles false positives instead.
-    # All other CWEs: pass source_dir so wrapper-only findings are excluded.
-    filter_dir = None if cwe_id == "cwe-079" else source_dir
+    # All CWEs (079 included, wrapper v4 is source-only): pass source_dir so
+    # wrapper-region findings are excluded and every detection is in the code.
+    filter_dir = source_dir
 
     # Step 2a: target-CWE analysis
     run_analysis(codeql, cwe_id, db_dir, query_paths, sarif_target, dry_run)

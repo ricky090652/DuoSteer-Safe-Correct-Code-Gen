@@ -60,9 +60,9 @@ export OPENAI_API_KEY=...
 Run the stages in order. Each stage's README lists the exact commands.
 
 1. [`dataset_construction/README.md`](dataset_construction/README.md): build CodeSec-Pairs.
-2. (Coming soon) [`localization/README.md`](localization/README.md): probes and causal head knockout.
-3. (Coming soon) [`steering/README.md`](steering/README.md): steering vectors, single-vector steering, and DuoSteer.
-4. (Coming soon) [`evaluation/README.md`](evaluation/README.md): vulnerability, correctness, and execution-based evaluation.
+2. [`localization/README.md`](localization/README.md): probes and causal head knockout.
+3. [`steering/README.md`](steering/README.md): steering vectors, single-vector steering, and DuoSteer.
+4. [`evaluation/README.md`](evaluation/README.md): vulnerability, correctness, and execution-based evaluation.
 
 The [released datasets](https://huggingface.co/datasets/haaao821/CodeSec-Pairs) let you skip the expensive parts of Stage 1. The contrastive pairs are released for both Llama-3.1-8B-Instruct and Qwen-2.5-Coder-7B-Instruct.
 

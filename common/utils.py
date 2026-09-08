@@ -1,5 +1,4 @@
-"""Thin JSON/JSONL I/O wrappers (reconstructed 2026-07-10 from utils.cpython-39.pyc
-after the original file went missing; byte-compatible behavior)."""
+"""Thin JSON/JSONL I/O wrappers."""
 import json
 
 

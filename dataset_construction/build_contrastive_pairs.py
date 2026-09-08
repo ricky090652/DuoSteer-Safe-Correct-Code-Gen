@@ -1,553 +1,383 @@
 """
-Build two contrastive (safe, vulnerable) pair datasets per (question, CWE).
+build_contrastive_pairs.py
 
-Pairing rules (enforced in this script unless noted):
-  1. Vulnerable code findings must be in the generated function body, NOT the
-     CodeQL entry-point wrapper. Enforced upstream: format_output_new.py must be
-     run with --source_dir so wrapper-only findings are excluded from *_issues.json
-     before this script reads them.
-     Exception: cwe-079 — the XSS sink (make_response) is necessarily in the
-     wrapper; format_output_new.py must be run WITHOUT --source_dir for cwe-079.
-  2. No duplicate code within a (record_id, CWE): pairs are deduplicated by MD5
-     hash of the raw response text.
-  3. Safe code must be syntax-error free. Enforced by only considering gen indices
-     that appear as .py files in the CodeQL source directory (prepare_codeql.py
-     runs ast.parse() before writing any file).
-  4. Number of pairs equals the number of unique vulnerable code snippets identified
-     (one pair per unique vulnerable gen, across all records and CWEs).
-  5. Safe code may be reused across pairs only when there are fewer clean safe gens
-     than vulnerable gens for the same (record_id, CWE). The safe pool is cycled
-     round-robin in that case.
-  6. Safe and vulnerable code in each pair come from the same question (record_id).
-  7. safe_only: both sides come from the benign (safe) prompt group; variation
-     arises from stochastic sampling differences across generations.
-  8. cross_group: vulnerable side from vuln or vuln_generic prompt; safe side
-     from the benign (safe) prompt, same record_id.
+Stage 1, step 6: extract safe-vs-vulnerable contrastive pairs from a completed
+local CodeQL run (prepare_local_codeql.py package, after run_codeql.sh and
+parse_codeql_results.py).
 
-Each gen is tagged only with the TARGET CWE ID for the query that detected it
-(e.g. cwe-022, not the related sub-CWEs cwe-023/036/073). This avoids inflating
-pair counts with taxonomically-related CWEs that map to the same vulnerability.
+Pair definitions:
+  intra  same benign prompt on both sides: vuln = a benign-prompt generation that
+         CodeQL flagged for CWE X; safe = a benign-prompt generation of the same
+         question that no studied query flagged.
+  cross  vuln = a generation from a vulnerability-eliciting prompt (vuln or
+         vuln_generic group) flagged for X; safe = a clean benign-prompt generation
+         of the same question.
 
-Output:
-  data/contrastive_pairs/contrastive_pairs_safe_only_<mode>.jsonl
-  data/contrastive_pairs/contrastive_pairs_cross_group_<mode>.jsonl
+Rules enforced here:
+  1. Completeness of BOTH sides. Every safe_code and vuln_code passes the same
+     completeness gate as extraction (compiles, not a bare fragment, no
+     undefined local names in def-free scripts). Candidates that fail are dropped.
+  2. Targeted tasks anchor on their target CWE. A task that carries a target CWE
+     (e.g. CyberSecEval-Instruct, SecurityEval, CodeLMSec) contributes pairs only
+     for that CWE, and only when CodeQL actually flagged the vulnerable side for
+     it, so prompt intent and CodeQL label agree. Targets outside the studied set
+     contribute nothing.
+  3. Untargeted tasks use their CodeQL label as the CWE. Tasks without a target
+     CWE (Emergent-Misalignment, cwe_id 0) take whatever studied CWE CodeQL
+     flagged. A question may then serve several CWEs; --max_cwes_per_question caps
+     that overlap and prefers the emptier CWEs.
+  4. The label maps to the exact snippet shown. The vulnerable side's detection is
+     an in-code finding on THAT snippet for THAT CWE (wrapper-region findings were
+     already dropped by parse_codeql_results.py). The safe side is in labels_none
+     (flagged by no studied query). The matching detections are carried into
+     vuln_codeql_detections.
+  5. Dedup: no duplicate vuln_code per (question, CWE); the safe pool is cycled so
+     safe_code is reused only when there are fewer clean generations than
+     vulnerable ones.
+  6. Optional: keep valid previous pairs (--prev_dir). An earlier pair set for the
+     same model is re-validated against rules 1 and 4 and used to top up any
+     (CWE, kind) bucket that is below its target. When a previous snippet is also
+     in the new pool, the new run's label is authoritative; otherwise its stored
+     detections must reference the CWE, and for CWE-079 the code must contain its
+     own html sink.
+
+Output: <out_dir>/codesec_pairs_cwe-<NNN>_{intra,cross}.jsonl with fields
+  id, cwe_id ("022" style), question, source, prompt (rendered at run time from
+  the templates in common/prompts.py), safe_code, vuln_code
+  (both fenced ```python blocks), vuln_codeql_detections [{query, cwe, line}].
+Ids are provisional; run finalize_ids.py next.
 
 Usage:
-  python build_contrastive_pairs.py --mode sampling
-  python build_contrastive_pairs.py --mode greedy
-  python build_contrastive_pairs.py --mode sampling --cwe cwe-022 cwe-079
+  python dataset_construction/build_contrastive_pairs.py --model llama \
+      --labels_dir data/local_codeql/llama \
+      --code_glob 'data/code_gen_extracted/llama/*.jsonl' \
+      --out_dir data/contrastive_pairs/llama
+  # capped set, e.g. 300 intra / 200 cross per CWE
+  python dataset_construction/build_contrastive_pairs.py --model qwen ... \
+      --cap_intra 300 --cap_cross 200
 """
 from __future__ import annotations
 
+# --- repo path setup: allow running this script from any directory ---
+import sys as _sys
+from pathlib import Path as _Path
+_REPO_ROOT = _Path(__file__).resolve().parents[1]
+for _d in ("common", "dataset_construction"):
+    _p = _REPO_ROOT / _d
+    if _p.is_dir() and str(_p) not in _sys.path:
+        _sys.path.insert(0, str(_p))
+# ---------------------------------------------------------------------
 import argparse
-import hashlib
+import glob
 import json
-import sys
-from collections import defaultdict, Counter
-from itertools import cycle
-from pathlib import Path
+import os
 import re
+from collections import defaultdict
 
-BASE = Path(__file__).resolve().parents[1]
+from extract_code import strip_fences, is_complete, group_from_filename
+from prompts import build_generation_prompt, load_cwe_db
 
-ALL_CWES = ["cwe-022", "cwe-079", "cwe-094", "cwe-295", "cwe-502"]
+STUDIED = ["022", "079", "094", "295", "502"]
+STUDIED_SET = set(STUDIED)
+SAFE_UID = re.compile(r"[^A-Za-z0-9_.-]+")
+HTML = re.compile(r'render_template_string|render_template|make_response|Markup|'
+                  r'Response\(|<[a-zA-Z/][^>]*>|text/html', re.I)
+GROUP_PROMPT_TYPE = {"safe": "code_gen", "vuln": "code_gen_vuln", "vuln_generic": "code_gen_vuln_generic"}
 
-RES_FILES = {
-    "sampling": {
-        "safe": [
-            "data/code_gen_results_sampling/res_code_gen_combined_no_seccodeplt_part1.jsonl",
-            "data/code_gen_results_sampling/res_code_gen_combined_no_seccodeplt_part2.jsonl",
-            "data/code_gen_results_sampling/res_code_gen_combined_no_seccodeplt_part3.jsonl",
-        ],
-        "vuln": [
-            "data/code_gen_results_sampling/res_code_gen_combined_no_seccodeplt_vuln.jsonl",
-        ],
-        "vuln_generic": [
-            "data/code_gen_results_sampling/res_code_gen_combined_no_seccodeplt_vuln_generic_part1.jsonl",
-            "data/code_gen_results_sampling/res_code_gen_combined_no_seccodeplt_vuln_generic_part2.jsonl",
-            "data/code_gen_results_sampling/res_code_gen_combined_no_seccodeplt_vuln_generic_part3.jsonl",
-        ],
-    },
-    "greedy": {
-        "safe": [
-            "data/code_gen_results_greedy/res_code_gen_combined_no_seccodeplt_greedy_part1.jsonl",
-            "data/code_gen_results_greedy/res_code_gen_combined_no_seccodeplt_greedy_part2.jsonl",
-            "data/code_gen_results_greedy/res_code_gen_combined_no_seccodeplt_greedy_part3.jsonl",
-        ],
-        "vuln": [
-            "data/code_gen_results_greedy/res_code_gen_combined_no_seccodeplt_vuln_greedy.jsonl",
-        ],
-        "vuln_generic": [
-            "data/code_gen_results_greedy/res_code_gen_combined_no_seccodeplt_vuln_generic_greedy_part1.jsonl",
-            "data/code_gen_results_greedy/res_code_gen_combined_no_seccodeplt_vuln_generic_greedy_part2.jsonl",
-            "data/code_gen_results_greedy/res_code_gen_combined_no_seccodeplt_vuln_generic_greedy_part3.jsonl",
-        ],
-    },
-}
 
-GROUP_SPECIFIC_FIELDS = {"messages", "vulnerability_type", "vulnerability_description"}
-EXCLUDE_FIELDS = {"predicted_code"}
+def norm_cwe(x) -> str:
+    """'cwe-22' / '22' / 22 -> '022'; unspecified -> '000'."""
+    s = re.sub(r"[^0-9]", "", str(x))
+    s = s.lstrip("0")
+    return s.zfill(3) if s else "000"
 
-# gen_idx -> {cwes: set[str], detections: list[dict]}
-GenFindings = dict[int, dict]
+
+def uid_for(group, rid, gen_idx):
+    return SAFE_UID.sub("-", f"{group}__{rid}__g{gen_idx}")
+
+
+def fenced(code: str) -> str:
+    return "```python\n" + code + "\n```"
 
 
 # --------------------------------------------------------------------------- #
-# Helpers
+# loaders
 # --------------------------------------------------------------------------- #
 
-def response_hash(text: str) -> str:
-    return hashlib.md5(text.encode()).hexdigest()
+def load_labels(labels_dir):
+    """uid -> set of studied CWEs flagged in-code; uid -> detections; set of clean uids."""
+    flagged, detmap = {}, {}
+    for line in open(os.path.join(labels_dir, "labels.jsonl")):
+        r = json.loads(line)
+        cwes = {norm_cwe(c) for c in r.get("cwes", [])} & STUDIED_SET
+        if cwes:
+            flagged[r["uid"]] = cwes
+            detmap[r["uid"]] = r.get("detections", [])
+    clean = set()
+    np_ = os.path.join(labels_dir, "labels_none.txt")
+    if os.path.exists(np_):
+        clean = {l.strip() for l in open(np_) if l.strip()}
+    return flagged, detmap, clean
 
 
-def make_gen_entry(
-    rec: dict,
-    group: str,
-    gen_idx: int,
-    raw: str,
-    codeql_detections: list[dict] | None = None,
-) -> dict:
-    entry = {"group": group, "gen_index": gen_idx, "response": raw}
-    if codeql_detections is not None:
-        entry["codeql_detections"] = codeql_detections
-    entry.update({k: v for k, v in rec.items() if k in GROUP_SPECIFIC_FIELDS})
-    return entry
+def load_pool(code_glob, group_override=None):
+    """uid -> {code, rid, source, cwe_prompt, group, gen_idx}; rid -> task record
+    (question, cwe_id, vulnerability_type/description if present)."""
+    pool, task = {}, {}
+    paths = sorted(glob.glob(code_glob))
+    if not paths:
+        raise SystemExit(f"no files match {code_glob}")
+    for path in paths:
+        g = group_override or group_from_filename(path)
+        for line in open(path):
+            line = line.strip()
+            if not line:
+                continue
+            r = json.loads(line)
+            rid = r["id"]
+            task.setdefault(rid, {k: r.get(k) for k in
+                                  ("question", "cwe_id", "vulnerability_type", "vulnerability_description")})
+            src = r.get("source", "?")
+            cwe_prompt = norm_cwe(r.get("cwe_id", "0"))
+            preds = r.get("predicted_code", []) or []
+            if isinstance(preds, str):
+                preds = [preds]
+            for i, code in enumerate(preds):
+                pool[uid_for(g, rid, i)] = {"code": code, "rid": rid, "source": src,
+                                            "cwe_prompt": cwe_prompt, "group": g, "gen_idx": i}
+    return pool, task
 
-
-def make_pair(shared_meta: dict, cwe_id: str, safe_entry: dict, vuln_entry: dict) -> dict:
-    """Assemble one flat pair record from the two gen entries.
-
-    Pair records store code only; user prompts are reconstructed at runtime
-    from the question by the pipeline scripts (see extract_representations.py
-    --prompt_mode).
-    """
-    return {
-        **shared_meta,
-        "cwe_id": cwe_id,
-        "safe_code": safe_entry["response"],
-        "vuln_code": vuln_entry["response"],
-        "vuln_codeql_detections": vuln_entry.get("codeql_detections", []),
-    }
-
-
-def detections_for_cwe(detections: list[dict], cwe_id: str) -> list[dict]:
-    return [d for d in detections if cwe_id in d.get("cweIds", [])]
-
-
-def build_shared_meta(rec: dict) -> dict:
-    """Extract shared metadata; drop the source dataset's cwe_id (the pair's
-    cwe_id is set from the CodeQL detection, not the question's nominal CWE)."""
-    meta = {
-        k: v for k, v in rec.items()
-        if k not in GROUP_SPECIFIC_FIELDS and k not in {"responses", "cwe_id"} | EXCLUDE_FIELDS
-    }
-    return meta
 
 
 # --------------------------------------------------------------------------- #
-# Step 1: Load CodeQL findings per group
+# extraction
 # --------------------------------------------------------------------------- #
 
-def load_findings(codeql_base: Path, cwe_ids: list[str]) -> dict[str, GenFindings]:
-    """
-    Returns findings[record_id][gen_idx] = {
-        "cwes":       set of TARGET cwe_ids detected in this gen,
-        "detections": list of detection dicts from all triggered queries,
-    }
+def complete_code(raw):
+    """Clean code if it passes the completeness gate, else None."""
+    c = strip_fences(raw)
+    return c if is_complete(c) else None
 
-    Only gen indices that appear as .py files in the CodeQL source directories
-    are included (Rule 3: syntax-error-free guarantee from prepare_codeql.py).
 
-    Each gen is tagged with the TARGET CWE ID only (e.g. "cwe-022"), not
-    sub-CWEs like "cwe-023". This prevents pair-count inflation from
-    taxonomically-related CWEs.
+def build(model, labels_dir, code_glob, prev_dir, out_dir,
+          cap_intra=0, cap_cross=0, max_cwes_per_q=2, match_prev_counts=False,
+          untargeted_sources=("emergent-misalignment",), group_override=None):
+    flagged, detmap, clean = load_labels(labels_dir)
+    pool, task = load_pool(code_glob, group_override)
+    cwe_db = load_cwe_db()
+    question = {rid: (tk.get("question") or "") for rid, tk in task.items()}
+    untargeted = set(untargeted_sources)
+    rid_meta = {}
+    for m in pool.values():
+        rid_meta.setdefault(m["rid"], (m["source"], m["cwe_prompt"]))
 
-    Requires format_output_new.py to have been run with --source_dir so that
-    wrapper-induced false positives are already excluded from *_issues.json
-    (Rule 1).
-    """
-    # Determine syntax-valid gen indices from the first available CWE dir.
-    # All CWE dirs contain the same files (prepare_codeql.py writes each
-    # syntax-valid gen to every CWE dir).
-    written: dict[str, set[int]] = defaultdict(set)
-    for cwe_id in cwe_ids:
-        cwe_dir = codeql_base / cwe_id
-        if cwe_dir.is_dir():
-            for py_file in cwe_dir.glob("*.py"):
-                m = re.match(r"(.+)__gen(\d+)\.py$", py_file.name)
-                if m:
-                    written[m.group(1)].add(int(m.group(2)))
-            break  # one dir is sufficient
-
-    if not written:
-        print(f"  [WARN] No .py files found under {codeql_base}", file=sys.stderr)
-
-    # Load per-CWE detection results and merge.
-    raw_det: dict[str, dict[int, dict]] = {}
-
-    for cwe_id in cwe_ids:
-        json_path = codeql_base / f"{cwe_id}_issues.json"
-        if not json_path.exists():
-            print(f"  [WARN] Missing findings: {json_path}", file=sys.stderr)
+    # per-question candidate buckets (uids), completeness-gated (rule 1)
+    safe_clean = defaultdict(list)                       # q -> [uid]
+    safe_flag = defaultdict(lambda: defaultdict(list))   # q -> X -> [uid]
+    cross_flag = defaultdict(lambda: defaultdict(list))  # q -> X -> [uid]
+    code_cache = {}
+    n_incomplete = 0
+    for uid, m in pool.items():
+        c = complete_code(m["code"])
+        if c is None:
+            n_incomplete += 1
             continue
-        with open(json_path) as f:
-            issues = json.load(f)
-        for e in issues.get("Results", []):
-            fname = Path(e["fileName"]).name
-            m = re.match(r"(.+)__gen(\d+)\.py$", fname)
-            if not m:
+        code_cache[uid] = c
+        q = m["rid"]
+        if m["group"] == "safe":
+            if uid in clean:
+                safe_clean[q].append(uid)
+            elif uid in flagged:
+                for X in flagged[uid]:
+                    safe_flag[q][X].append(uid)
+        else:
+            if uid in flagged:
+                for X in flagged[uid]:
+                    cross_flag[q][X].append(uid)
+
+    def q_cwes(q):
+        src, cwe_prompt = rid_meta.get(q, (None, "000"))
+        if src not in untargeted and cwe_prompt != "000":
+            return [cwe_prompt] if cwe_prompt in STUDIED_SET else []   # rule 2
+        found = set(safe_flag[q].keys()) | set(cross_flag[q].keys())    # rule 3
+        return sorted(found & STUDIED_SET)
+
+    def get_prompt(kind, q, grp):
+        """Render the prompt of the vulnerable side's group from the task (run time)."""
+        g = "safe" if kind == "intra" else grp
+        tk = task.get(q, {})
+        return build_generation_prompt(
+            tk.get("question") or "", GROUP_PROMPT_TYPE[g], cwe_id=tk.get("cwe_id", "0"),
+            cwe_db=cwe_db, vulnerability_type=tk.get("vulnerability_type"),
+            vulnerability_description=tk.get("vulnerability_description"))
+
+    pairs = {X: {"intra": [], "cross": []} for X in STUDIED}
+    q_cwe_used = defaultdict(set)
+
+    def emit(kind, X, q, vuln_uid, safe_uid):
+        m = pool[vuln_uid]
+        return {
+            "id": f"codesec-{model}-{X}-{kind}-{q}-g{m['gen_idx']}",
+            "cwe_id": X, "question": question.get(q, ""),
+            "source": m["source"], "prompt": get_prompt(kind, q, m["group"]),
+            "safe_code": fenced(code_cache[safe_uid]),
+            "vuln_code": fenced(code_cache[vuln_uid]),
+            "vuln_codeql_detections": [d for d in detmap.get(vuln_uid, [])
+                                       if norm_cwe(d.get("cwe")) == X],
+        }
+
+    for q in sorted(safe_flag.keys() | cross_flag.keys()):
+        cwes = q_cwes(q)
+        if max_cwes_per_q and len(cwes) > max_cwes_per_q:   # overlap reduction (rule 3)
+            cwes = sorted(cwes, key=lambda X: len(pairs[X]["intra"]) + len(pairs[X]["cross"]))[:max_cwes_per_q]
+        for X in cwes:
+            clean_uids = list(dict.fromkeys(safe_clean[q]))
+            if not clean_uids:
                 continue
-            rid, gen_idx = m.group(1), int(m.group(2))
-            if rid not in raw_det:
-                raw_det[rid] = {}
-            if gen_idx not in raw_det[rid]:
-                raw_det[rid][gen_idx] = {"cwes": set(), "detections": []}
-            # Tag with TARGET cwe_id only (not sub-CWEs)
-            raw_det[rid][gen_idx]["cwes"].add(cwe_id)
-            raw_det[rid][gen_idx]["detections"].extend(e.get("CWEs", []))
-
-    # Build final findings dict restricted to syntax-valid gens (Rule 3)
-    findings: dict[str, GenFindings] = {}
-    for rid, gen_set in written.items():
-        findings[rid] = {}
-        for gen_idx in sorted(gen_set):
-            if rid in raw_det and gen_idx in raw_det[rid]:
-                findings[rid][gen_idx] = raw_det[rid][gen_idx]
-            else:
-                findings[rid][gen_idx] = {"cwes": set(), "detections": []}
-
-    return findings
-
-
-# --------------------------------------------------------------------------- #
-# Step 2: Load res files — metadata + raw responses
-# --------------------------------------------------------------------------- #
-
-def load_res_data(mode: str) -> dict[str, dict[str, dict]]:
-    """
-    Returns res_data[group][record_id] = {
-        ...record fields minus predicted_code...,
-        "responses": list[str]   (raw predicted_code entries)
-    }
-    """
-    res_data: dict[str, dict[str, dict]] = {}
-    for group, file_list in RES_FILES[mode].items():
-        group_records: dict[str, dict] = {}
-        for fname in file_list:
-            fpath = BASE / fname
-            if not fpath.exists():
-                print(f"  [WARN] Missing: {fpath}", file=sys.stderr)
-                continue
-            with open(fpath) as f:
-                for line in f:
-                    d = json.loads(line)
-                    rid = d["id"]
-                    if rid in group_records:
+            for kind, bucket in (("intra", safe_flag), ("cross", cross_flag)):
+                seen_v, si = set(), 0
+                for vuid in bucket[q].get(X, []):
+                    vc = code_cache[vuid]
+                    if vc in seen_v:                          # rule 5
                         continue
-                    record = {k: v for k, v in d.items() if k not in EXCLUDE_FIELDS}
-                    predicted = d.get("predicted_code", [])
-                    record["responses"] = predicted if isinstance(predicted, list) else [predicted]
-                    group_records[rid] = record
-        res_data[group] = group_records
-    return res_data
+                    seen_v.add(vc)
+                    suid = clean_uids[si % len(clean_uids)]; si += 1
+                    pairs[X][kind].append(emit(kind, X, q, vuid, suid))
+                    q_cwe_used[q].add(X)
+
+    # new-run maps so previous pairs can be judged by the authoritative new labels
+    newcode_cwes, newcode_dets, newcode_clean = defaultdict(set), {}, set()
+    for uid, c in code_cache.items():
+        if uid in flagged:
+            newcode_cwes[c] |= flagged[uid]
+            newcode_dets.setdefault(c, detmap.get(uid, []))
+        elif uid in clean:
+            newcode_clean.add(c)
+
+    def prev_count(X, kind):
+        fp = os.path.join(prev_dir or "", f"codesec_pairs_cwe-{X}_{kind}.jsonl")
+        return sum(1 for _ in open(fp)) if os.path.exists(fp) else 0
+
+    caps = {}
+    for X in STUDIED:
+        for kind in ("intra", "cross"):
+            caps[(X, kind)] = prev_count(X, kind) if match_prev_counts \
+                else (cap_intra if kind == "intra" else cap_cross)
+    kept_prev = defaultdict(lambda: defaultdict(int))
+    short = []
+    for X in STUDIED:
+        for kind in ("intra", "cross"):
+            cap = caps[(X, kind)]
+            lst = pairs[X][kind]
+            if cap and len(lst) >= cap:
+                pairs[X][kind] = lst[:cap]
+            elif prev_dir and os.path.isdir(prev_dir):
+                need = (cap - len(lst)) if cap else None
+                kept_prev[X][kind] = _topup_previous(
+                    prev_dir, X, kind, pairs[X][kind], need,
+                    newcode_cwes, newcode_dets, newcode_clean)
+            if cap and len(pairs[X][kind]) < cap:
+                short.append((X, kind, len(pairs[X][kind]), cap))
+
+    os.makedirs(out_dir, exist_ok=True)
+    for X in STUDIED:
+        for kind in ("intra", "cross"):
+            fp = os.path.join(out_dir, f"codesec_pairs_cwe-{X}_{kind}.jsonl")
+            with open(fp, "w") as f:
+                for rec in pairs[X][kind]:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    print(f"\n=== {model} contrastive pairs ===")
+    print(f"snippets in pool: {len(pool)}  (dropped as incomplete: {n_incomplete})")
+    print(f"{'cwe':6}{'intra':>8}{'cross':>8}{'kept_prev(i/c)':>18}")
+    for X in STUDIED:
+        kp = kept_prev[X]
+        print(f"{X:6}{len(pairs[X]['intra']):>8}{len(pairs[X]['cross']):>8}"
+              f"{str(kp.get('intra',0))+'/'+str(kp.get('cross',0)):>18}")
+    multi = sum(1 for s in q_cwe_used.values() if len(s) > 1)
+    print(f"questions used: {len(q_cwe_used)}; serving >1 CWE: {multi}")
+    if short:
+        print("BELOW TARGET (top up with topup_cross_model.py if wanted):")
+        for X, kind, have_n, cap in short:
+            print(f"  cwe-{X} {kind}: {have_n}/{cap}")
+    print(f"written to {out_dir}")
 
 
-# --------------------------------------------------------------------------- #
-# Step 3a: safe-only pairs (both sides from 'safe' prompt group, Rule 7)
-# --------------------------------------------------------------------------- #
+def _norm_dets(dets, X):
+    """Any detection schema -> [{query, cwe, line}], filtered to X."""
+    out = []
+    for d in dets:
+        cwes = {norm_cwe(c) for c in ([d.get("cwe")] + (d.get("cweIds") or [])) if c}
+        if X in cwes:
+            out.append({"query": d.get("query") or d.get("queryName") or "",
+                        "cwe": X, "line": d.get("line", d.get("startLine"))})
+    return out
 
-def build_safe_only_pairs(
-    safe_findings: dict[str, GenFindings],
-    res_data: dict[str, dict[str, dict]],
-) -> list[dict]:
-    safe_records = res_data["safe"]
-    pairs = []
 
-    for record_id in sorted(safe_records.keys()):
-        rec = safe_records[record_id]
-        shared_meta = build_shared_meta(rec)
-        responses = rec["responses"]
-        gen_findings = safe_findings.get(record_id, {})
-
-        # CWEs triggered in any safe gen for this record
-        all_cwes: set[str] = set()
-        for entry in gen_findings.values():
-            all_cwes.update(entry["cwes"])
-        if not all_cwes:
+def _topup_previous(prev_dir, X, kind, existing, need, newcode_cwes, newcode_dets, newcode_clean):
+    """Fill an under-target (X, kind) bucket from a previous pair set (rule 6).
+    Returns how many pairs were added. need=None takes every valid pair."""
+    fp = os.path.join(prev_dir, f"codesec_pairs_cwe-{X}_{kind}.jsonl")
+    if not os.path.exists(fp):
+        return 0
+    have = {p["vuln_code"] for p in existing}
+    added = 0
+    for line in open(fp):
+        if need is not None and added >= need:
+            break
+        r = json.loads(line)
+        sc = complete_code(r.get("safe_code", "")); vc = complete_code(r.get("vuln_code", ""))
+        if sc is None or vc is None:                              # rule 1
             continue
-
-        for cwe_id in sorted(all_cwes):
-            # Vulnerable side: safe-group gens where this CWE is detected (Rule 7)
-            vuln_gens: list[dict] = []
-            seen_vuln: set[str] = set()
-            for gen_idx, entry in sorted(gen_findings.items()):
-                if cwe_id not in entry["cwes"] or gen_idx >= len(responses):
-                    continue
-                raw = responses[gen_idx]
-                h = response_hash(raw)
-                if h in seen_vuln:  # Rule 2: no duplicates
-                    continue
-                seen_vuln.add(h)
-                vuln_gens.append(make_gen_entry(
-                    rec, "safe", gen_idx, raw,
-                    codeql_detections=detections_for_cwe(entry["detections"], cwe_id),
-                ))
-
-            if not vuln_gens:
+        if (vc in newcode_cwes) or (vc in newcode_clean):         # snippet in the new pool
+            if X not in newcode_cwes.get(vc, set()):
                 continue
-
-            # Safe side: safe-group gens where this CWE is NOT detected (Rule 6+7)
-            safe_gens: list[dict] = []
-            seen_safe: set[str] = set()
-            for gen_idx, entry in sorted(gen_findings.items()):
-                if cwe_id in entry["cwes"] or gen_idx >= len(responses):
-                    continue
-                raw = responses[gen_idx]
-                h = response_hash(raw)
-                if h in seen_safe:  # Rule 2
-                    continue
-                seen_safe.add(h)
-                safe_gens.append(make_gen_entry(rec, "safe", gen_idx, raw))
-
-            if not safe_gens:
+            if sc not in newcode_clean:
                 continue
-
-            # Rule 4: one pair per unique vulnerable gen
-            # Rule 5: cycle safe gens (reuse only when pool is exhausted)
-            safe_pool = cycle(safe_gens)
-            for vuln_entry in vuln_gens:
-                pairs.append(make_pair(shared_meta, cwe_id, next(safe_pool), vuln_entry))
-
-    return pairs
-
-
-# --------------------------------------------------------------------------- #
-# Step 3b: cross-group pairs (vuln/vuln_generic → safe, Rule 8)
-# --------------------------------------------------------------------------- #
-
-def build_cross_group_pairs(
-    all_findings: dict[str, dict[str, GenFindings]],
-    res_data: dict[str, dict[str, dict]],
-) -> list[dict]:
-    VULN_GROUPS = ["vuln", "vuln_generic"]
-
-    all_record_ids: set[str] = set()
-    for g in VULN_GROUPS:
-        all_record_ids.update(res_data[g].keys())
-
-    pairs = []
-
-    for record_id in sorted(all_record_ids):
-        # Safe side must exist (Rule 6+8)
-        safe_rec = res_data["safe"].get(record_id)
-        if not safe_rec:
+            dets = _norm_dets(newcode_dets.get(vc, []), X)
+        else:                                                     # absent from the new run
+            dets = _norm_dets(r.get("vuln_codeql_detections") or [], X)
+            if not dets:                                          # rule 4
+                continue
+            if X == "079" and not HTML.search(vc):                # own html sink required
+                continue
+        if fenced(vc) in have:
             continue
-        safe_responses = safe_rec["responses"]
-        safe_gen_findings = all_findings["safe"].get(record_id, {})
-
-        shared_meta = build_shared_meta(safe_rec)
-
-        # CWEs detected in any vuln/vuln_generic gen for this record (Rule 8)
-        all_cwes: set[str] = set()
-        for g in VULN_GROUPS:
-            for entry in all_findings[g].get(record_id, {}).values():
-                all_cwes.update(entry["cwes"])
-        if not all_cwes:
-            continue
-
-        for cwe_id in sorted(all_cwes):
-            # Vulnerable side: vuln/vuln_generic gens where this CWE is detected
-            vuln_gens: list[dict] = []
-            seen_vuln: set[str] = set()
-            for g in VULN_GROUPS:
-                rec = res_data[g].get(record_id)
-                if not rec:
-                    continue
-                responses = rec["responses"]
-                for gen_idx, entry in sorted(all_findings[g].get(record_id, {}).items()):
-                    if cwe_id not in entry["cwes"] or gen_idx >= len(responses):
-                        continue
-                    raw = responses[gen_idx]
-                    h = response_hash(raw)
-                    if h in seen_vuln:  # Rule 2
-                        continue
-                    seen_vuln.add(h)
-                    vuln_gens.append(make_gen_entry(
-                        rec, g, gen_idx, raw,
-                        codeql_detections=detections_for_cwe(entry["detections"], cwe_id),
-                    ))
-
-            if not vuln_gens:
-                continue
-
-            # Safe side: safe-group gens where this CWE is NOT detected (Rule 3+6+8)
-            safe_gens: list[dict] = []
-            seen_safe: set[str] = set()
-            for gen_idx, entry in sorted(safe_gen_findings.items()):
-                if cwe_id in entry["cwes"] or gen_idx >= len(safe_responses):
-                    continue
-                raw = safe_responses[gen_idx]
-                h = response_hash(raw)
-                if h in seen_safe:  # Rule 2
-                    continue
-                seen_safe.add(h)
-                safe_gens.append(make_gen_entry(safe_rec, "safe", gen_idx, raw))
-
-            if not safe_gens:
-                continue
-
-            # Rule 4+5
-            safe_pool = cycle(safe_gens)
-            for vuln_entry in vuln_gens:
-                pairs.append(make_pair(shared_meta, cwe_id, next(safe_pool), vuln_entry))
-
-    return pairs
-
-
-# --------------------------------------------------------------------------- #
-# Diversity cap (applied per CWE when that CWE's pair count exceeds threshold)
-# --------------------------------------------------------------------------- #
-
-def apply_diversity_cap(
-    pairs: list[dict],
-    max_per_question: int,
-    threshold: int = 2000,
-) -> list[dict]:
-    """
-    For each CWE whose pair count exceeds `threshold`, limit each question
-    (record_id) to at most `max_per_question` pairs for that CWE.
-
-    CWEs below the threshold are left untouched — no diversity cap is needed
-    when the total is already small.
-
-    Pairs are kept in their original order (first N per question per CWE).
-    """
-    cwe_counts = Counter(p["cwe_id"] for p in pairs)
-    capped_cwes = {cwe for cwe, cnt in cwe_counts.items() if cnt > threshold}
-
-    if not capped_cwes:
-        return pairs
-
-    per_question: dict[tuple, int] = defaultdict(int)
-    result = []
-    for pair in pairs:
-        cwe_id = pair["cwe_id"]
-        if cwe_id not in capped_cwes:
-            result.append(pair)
-            continue
-        key = (pair["id"], cwe_id)
-        if per_question[key] < max_per_question:
-            per_question[key] += 1
-            result.append(pair)
-
-    return result
-
-
-# --------------------------------------------------------------------------- #
-# Main
-# --------------------------------------------------------------------------- #
-
-def print_stats(label: str, pairs: list[dict]) -> None:
-    print(f"\n[{label}] {len(pairs)} pairs total")
-    cwe_counts = Counter(p["cwe_id"] for p in pairs)
-    print("  By CWE:")
-    for cwe, cnt in sorted(cwe_counts.items()):
-        print(f"    {cwe}: {cnt}")
+        rec = {
+            "id": r.get("id", f"prev-{X}-{kind}-{added}"),
+            "cwe_id": X, "question": r.get("question", ""),
+            "source": r.get("source", "?"), "prompt": r.get("prompt", ""),
+            "safe_code": fenced(sc), "vuln_code": fenced(vc),
+            "vuln_codeql_detections": dets,
+        }
+        have.add(rec["vuln_code"])
+        existing.append(rec)
+        added += 1
+    return added
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Build safe/vulnerable contrastive pairs from CodeQL findings."
-    )
-    parser.add_argument(
-        "--mode", choices=["sampling", "greedy"], default="sampling",
-        help="Generation mode (default: sampling)",
-    )
-    parser.add_argument(
-        "--cwe", nargs="*", default=ALL_CWES,
-        metavar="CWE_ID",
-        help="CWE IDs to include (default: all 6)",
-    )
-    parser.add_argument(
-        "--max_pairs_per_question", type=int, default=3,
-        help=(
-            "Per-question pair limit applied only to CWEs whose total pair count "
-            "exceeds 1500 (default: 3). Set to 0 to disable the cap entirely."
-        ),
-    )
-    args = parser.parse_args()
-
-    cwe_ids = args.cwe
-    mode = args.mode
-    codeql_root = BASE / "data" / "codeql" / mode
-
-    # Reproduction intermediates go in a subdirectory so they stay separate from
-    # the packaged release files (data/contrastive_pairs/<model>_{intra,cross}.jsonl).
-    out_dir = BASE / "data" / "contrastive_pairs" / "raw"
-
-    print(f"Mode: {mode}  |  CWEs: {cwe_ids}")
-    print(f"Requires: format_output_new.py was run with --source_dir (Rule 1 — wrapper filter)")
-
-    print("\nLoading CodeQL findings...")
-    all_findings: dict[str, dict[str, GenFindings]] = {}
-    for group in ["safe", "vuln", "vuln_generic"]:
-        codeql_base = codeql_root / group
-        findings = load_findings(codeql_base, cwe_ids)
-        all_findings[group] = findings
-        n_gens = sum(len(v) for v in findings.values())
-        n_vuln = sum(
-            1 for gf in findings.values()
-            for entry in gf.values()
-            if entry["cwes"]
-        )
-        print(f"  [{group}] {len(findings)} records, {n_gens} syntax-valid gens, {n_vuln} with ≥1 CWE detected")
-
-    print("\nLoading res files...")
-    res_data = load_res_data(mode)
-    for group, gdata in res_data.items():
-        print(f"  [{group}] {len(gdata)} records")
-
-    print("\nBuilding safe-only pairs...")
-    safe_only_pairs = build_safe_only_pairs(all_findings["safe"], res_data)
-
-    print("Building cross-group pairs...")
-    cross_group_pairs = build_cross_group_pairs(all_findings, res_data)
-
-    # Diversity cap: limit per-question pairs for high-volume CWEs
-    if args.max_pairs_per_question > 0:
-        before_so = len(safe_only_pairs)
-        before_cg = len(cross_group_pairs)
-        safe_only_pairs   = apply_diversity_cap(safe_only_pairs,   args.max_pairs_per_question, threshold=1500)
-        cross_group_pairs = apply_diversity_cap(cross_group_pairs, args.max_pairs_per_question, threshold=1500)
-        if len(safe_only_pairs) < before_so or len(cross_group_pairs) < before_cg:
-            print(
-                f"\nDiversity cap (max {args.max_pairs_per_question}/question for CWEs >2000 pairs):"
-                f"\n  safe_only:   {before_so} → {len(safe_only_pairs)}"
-                f"\n  cross_group: {before_cg} → {len(cross_group_pairs)}"
-            )
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    def write_per_cwe(pairs: list[dict], prefix: str) -> None:
-        from collections import defaultdict
-        by_cwe: dict[str, list] = defaultdict(list)
-        for pair in pairs:
-            by_cwe[pair["cwe_id"]].append(pair)
-        for cwe_id, cwe_pairs in sorted(by_cwe.items()):
-            out_path = out_dir / f"{prefix}_{cwe_id}.jsonl"
-            with open(out_path, "w") as f:
-                for pair in cwe_pairs:
-                    f.write(json.dumps(pair) + "\n")
-            print(f"  Saved {len(cwe_pairs):>5} pairs → {out_path.name}")
-
-    print("\nWriting safe-only pairs:")
-    write_per_cwe(safe_only_pairs, f"contrastive_pairs_safe_only_{mode}")
-
-    print("Writing cross-group pairs:")
-    write_per_cwe(cross_group_pairs, f"contrastive_pairs_cross_group_{mode}")
-
-    print_stats("safe_only", safe_only_pairs)
-    print_stats("cross_group", cross_group_pairs)
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+    ap.add_argument("--model", required=True, help="short model name embedded in provisional ids")
+    ap.add_argument("--labels_dir", required=True,
+                    help="local CodeQL run dir (manifest.jsonl, labels.jsonl, labels_none.txt)")
+    ap.add_argument("--code_glob", required=True, help="extracted generation files (output of extract_code.py)")
+    ap.add_argument("--group", default=None, choices=["safe", "vuln", "vuln_generic"],
+                    help="prompt group of ALL --code_glob files (default: inferred from file names)")
+    ap.add_argument("--prev_dir", default=None, help="earlier pair set to re-validate and merge (rule 6)")
+    ap.add_argument("--out_dir", required=True)
+    ap.add_argument("--cap_intra", type=int, default=0, help="target intra pairs per CWE (0 = keep all)")
+    ap.add_argument("--cap_cross", type=int, default=0, help="target cross pairs per CWE (0 = keep all)")
+    ap.add_argument("--max_cwes_per_question", type=int, default=2,
+                    help="overlap cap for untargeted questions (0 = no cap)")
+    ap.add_argument("--match_prev_counts", action="store_true",
+                    help="per-CWE target = the count in --prev_dir")
+    ap.add_argument("--untargeted_sources", default="emergent-misalignment",
+                    help="comma-separated sources whose tasks carry no target CWE")
+    a = ap.parse_args()
+    build(a.model, a.labels_dir, a.code_glob, a.prev_dir, a.out_dir,
+          a.cap_intra, a.cap_cross, a.max_cwes_per_question, a.match_prev_counts,
+          tuple(s.strip() for s in a.untargeted_sources.split(",") if s.strip()), a.group)
 
 
 if __name__ == "__main__":

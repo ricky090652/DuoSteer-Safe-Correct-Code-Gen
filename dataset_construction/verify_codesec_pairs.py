@@ -39,7 +39,7 @@ CWE_NUMS = ["022", "079", "094", "295", "502"]
 STRUCT_LABELS = {"MINIMAL", "REFACTOR", "DIVERGENT"}
 FIX_LABELS = {"DELETION", "SUBSTITUTION", "ADDITION-GUARD", "ADDITION-CONFIG", "UNCLEAR"}
 ANN_FIELDS = ("structural_distance", "fix_mechanism", "annotation_rationale")
-CORE_FIELDS = ("id", "cwe_id", "question", "source", "src_id",
+CORE_FIELDS = ("id", "cwe_id", "question", "source",
                "prompt", "safe_code", "vuln_code", "vuln_codeql_detections")
 
 # Correctness pairs: cwe -> (expected train records, expected val records).
@@ -101,7 +101,7 @@ def main():
             for r in recs:
                 cwe = str(r.get("cwe_id"))
                 content_by_cwe[(cwe, content_key(r))] += 1
-                k = (cwe, r.get("source"), r.get("src_id"),
+                k = (cwe, r.get("source"), r.get("question"),
                      hashlib.md5(r["vuln_code"].strip().encode()).hexdigest())
                 if k in vuln_by_q:
                     errors.append(f"DUPVULN {path.name}: repeated vuln code for a (cwe, question)")

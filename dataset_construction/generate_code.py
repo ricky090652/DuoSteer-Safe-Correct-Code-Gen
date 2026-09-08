@@ -19,6 +19,7 @@ for _d in ("common", "dataset_construction"):
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from typing import Any, Dict, List, Optional, Tuple, Union
 from utils import read_jsonl, write_jsonl
+from prompts import build_generation_messages, load_cwe_db, PROMPT_TYPES
 
 import argparse
 import torch
@@ -129,7 +130,7 @@ def request_response(
     model_type: str,
     *,
     max_new_tokens: int = 2048,
-    prompt_key: str = "prompt",
+    prompt_type: str = "code_gen",
     num_samples: int = 1,
     do_sample: bool = False,
     temperature: float = 1.0,
@@ -137,21 +138,25 @@ def request_response(
     top_k: int = 0,
 ) -> None:
     data = read_jsonl(input_file)
+    cwe_db = load_cwe_db() if prompt_type == "code_gen_vuln" else None
     device = get_device()
     model, tokenizer = load_model_and_tokenizer(model_type, device=device)
 
     for i, dt in enumerate(data):
         if 'predicted_code' in dt:
             continue
-        message = dt.get(prompt_key) or dt.get("messages")
-        if message is None:
-            raise KeyError(f"Each item must have '{prompt_key}' or 'messages'. Keys: {list(dt.keys())}")
-        if isinstance(message, list):
-            message = tokenizer.apply_chat_template(
-                message,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
+        if "question" not in dt:
+            raise KeyError(f"Each item must have a 'question'. Keys: {list(dt.keys())}")
+        # the prompt is rendered here, at run time, from the task's question
+        message = tokenizer.apply_chat_template(
+            build_generation_messages(
+                dt["question"], prompt_type,
+                cwe_id=dt.get("cwe_id", dt.get("cwe-id", "0")), cwe_db=cwe_db,
+                vulnerability_type=dt.get("vulnerability_type"),
+                vulnerability_description=dt.get("vulnerability_description")),
+            tokenize=False,
+            add_generation_prompt=True,
+        )
         result = generate_response(
             model,
             tokenizer,
@@ -170,12 +175,15 @@ def request_response(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="LLaMA inference (no pipeline).")
-    parser.add_argument("-i", "--input_file", type=str, default="data/processed_secure_data.jsonl", help="Input JSONL file.")
-    parser.add_argument("-o", "--output_file", type=str, default="data/llama3.2_3B_secure_output.jsonl", help="Output JSONL file.")
+    parser = argparse.ArgumentParser(description="Sample code generations for a task file (id, question, cwe_id, source, src_id).")
+    parser.add_argument("-i", "--input_file", type=str, required=True, help="Task JSONL (each record needs a 'question').")
+    parser.add_argument("-o", "--output_file", type=str, required=True, help="Output JSONL (input fields + predicted_code).")
     parser.add_argument("-m", "--model_type", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="Huggingface model id.")
     parser.add_argument("--max_new_tokens", type=int, default=2048, help="Max new tokens to generate.")
-    parser.add_argument("--prompt_key", type=str, default="messages", help="Key for prompt text in each item (or use 'messages' for chat).")
+    parser.add_argument("--prompt_type", type=str, default="code_gen", choices=list(PROMPT_TYPES),
+                        help="Prompt template rendered from each task's question at run time: "
+                             "code_gen (benign), code_gen_vuln (CWE-specific eliciting; generic when "
+                             "the task has no CWE), code_gen_vuln_generic.")
     parser.add_argument("--num_samples", "-n", type=int, default=1, help="Number of samples per question (list when > 1).")
     parser.add_argument("--do_sample", action="store_true", help="Enable sampling.")
     parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature.")
@@ -188,7 +196,7 @@ if __name__ == "__main__":
         args.output_file,
         args.model_type,
         max_new_tokens=args.max_new_tokens,
-        prompt_key=args.prompt_key,
+        prompt_type=args.prompt_type,
         num_samples=args.num_samples,
         do_sample=args.do_sample,
         temperature=args.temperature,

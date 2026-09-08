@@ -21,7 +21,7 @@ condition produced the code.
 CWE WRAPPER ASSIGNMENTS
 -----------------------
   cwe-022  path traversal      args_string        all params from request.args (strings)
-  cwe-079  reflected XSS       args_string_xss    all params from request.args, result via make_response(text/html)
+  cwe-079  reflected XSS       args_string_xss    all params from request.args; result is NOT returned
   cwe-089  SQL injection        args_string        all params from request.args (strings)
   cwe-094  code injection       args_string        all params from request.args (strings)
   cwe-502  unsafe deserialize   bytes_first        first param = request.data (bytes), rest from request.args
@@ -30,14 +30,20 @@ CWEs that do NOT need a wrapper (CodeQL detects without taint source):
   (cwe-327 removed — dynamic getattr dispatch is undetectable by static analysis)
   cwe-295  cert validation      structural — checks for missing host-key / cert validation step
 
-VERSION: v3  (2026-05-08)
-Change from v2: wrapper now calls ALL top-level functions (not just the first).
-This fixes missed detections when a vulnerable function is defined after a helper.
+VERSION: v4  (2026-09-02)
+Change from v3: cwe-079 (reflected XSS) is now SOURCE-ONLY.  The wrapper feeds
+request.args into every function parameter (the source) but no longer renders the
+function's return value via make_response, and returns a constant instead.  This
+removes the harness-manufactured XSS: an XSS detection now requires the generated
+code's OWN html sink (render_template_string, its own make_response, or its own
+flask/django/FastAPI view returning the value), making every 079 label
+attributable to the code, exactly like the other four CWEs.  All other wrappers
+are unchanged from v3 (they still call ALL top-level functions).
 Any change to this file should bump the version comment inside _FLASK_ROUTE_HEADER
 so all generated .py files can be traced back to the wrapper version used.
 """
 
-import re
+import ast
 
 ENTRY_POINT_CWES = frozenset({"cwe-022", "cwe-079", "cwe-089", "cwe-094", "cwe-502"})
 
@@ -56,7 +62,9 @@ CWE_DESCRIPTIONS = {
     ),
     "cwe-079": (
         "Reflected XSS — user-controlled strings from request.args flow into the "
-        "HTML response body (Flask returns text/html by default)."
+        "function's parameters; a detection requires the code's own html sink "
+        "(render_template_string / its own make_response / its own view return). "
+        "The wrapper does not render the return value (source-only, v4)."
     ),
     "cwe-094": (
         "Code Injection — user-controlled code string from request.args flows into "
@@ -75,7 +83,7 @@ CWE_DESCRIPTIONS = {
 
 _FLASK_ROUTE_HEADER = """\
 
-# --- CodeQL entry-point wrapper (codeql_entry_points.py v3) ---
+# --- CodeQL entry-point wrapper (codeql_entry_points.py v4) ---
 from flask import Flask as _Flask, request as _req
 _app = _Flask(__name__)
 
@@ -83,71 +91,89 @@ _app = _Flask(__name__)
 def _codeql_entry():
 """
 
-_FLASK_ROUTE_HEADER_XSS = """\
-
-# --- CodeQL entry-point wrapper (codeql_entry_points.py v3) ---
-from flask import Flask as _Flask, request as _req, make_response as _mkr
-_app = _Flask(__name__)
-
-@_app.route("/_codeql_entry")
-def _codeql_entry():
-"""
-
-
-def _parse_params(params_str: str) -> list:
-    """Parse function parameter string → ordered list of bare parameter names."""
-    names = []
-    for token in params_str.split(","):
-        token = token.strip()
-        if not token or token in ("/", "*"):
-            continue
-        # Strip type annotation and default value; strip leading * (varargs)
-        name = re.sub(r"\s*[:=].*", "", token).strip().lstrip("*")
-        if name:
-            names.append(name)
-    return names
-
 
 def _find_all_functions(code: str) -> list:
-    """Return list of (func_name, param_names) for every top-level `def` in code.
+    """Return (func_name, pos_params, kw_params) for every top-level, non-dunder
+    `def`/`async def` in `code`, using the AST.
 
-    Only matches defs at column 0 (no indentation) so class methods are skipped.
-    Dunder functions (e.g. __init__) are also excluded because they require an
-    instance and cannot be called directly from a Flask route.
+    AST-based (v4): regex parsing corrupted parameter names whenever a type
+    annotation contained a comma inside brackets, e.g.
+    ``def f(cb: Callable[[str], str])`` was split into fake params
+    ``Callable[[str]`` and ``str]]`` and produced a wrapper that would not
+    compile (so CodeQL silently failed on that file). The AST gives clean
+    identifier names regardless of annotations or defaults.
+
+    - top-level only (class methods are skipped: they need an instance)
+    - dunder functions excluded
+    - pos_params = positional-or-keyword + positional-only args (passed by
+      position); kw_params = keyword-only args (passed by keyword). *args/**kwargs
+      are ignored (cannot be meaningfully tainted as a single argument).
+    Returns [] if the code does not parse.
     """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
     results = []
-    for m in re.finditer(r"^def (\w+)\(([^)]*)\)", code, re.MULTILINE):
-        fname = m.group(1)
-        if fname.startswith("__") and fname.endswith("__"):
-            continue
-        results.append((fname, _parse_params(m.group(2))))
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            name = node.name
+            if name.startswith("__") and name.endswith("__"):
+                continue
+            a = node.args
+            pos = [arg.arg for arg in (list(a.posonlyargs) + list(a.args))]
+            kw = [arg.arg for arg in a.kwonlyargs]
+            results.append((name, pos, kw))
     return results
 
 
 # ---------------------------------------------------------------------------
-# Wrapper builders  (one per wrapper type, now accept list of functions)
+# Wrapper builders  (one per wrapper type; accept _find_all_functions() output)
 # ---------------------------------------------------------------------------
 
+_ARGS_SRC = "_req.args.get({p!r}, '')"
+
+
+def _emit_call(indent: str, name: str, pos: list, kw: list, bytes_first: bool = False):
+    """Emit the taint-assignment lines and the call expression for one function.
+
+    Positional params are passed by position, keyword-only params by keyword.
+    Every param is fed a `request.args` string, except (bytes_first) the first
+    positional param, which is fed raw `request.data` (bytes).
+    """
+    lines = []
+    pos_vars = []
+    for j, p in enumerate(pos):
+        var = f"_{name}_{p}"
+        if bytes_first and j == 0:
+            lines.append(f"{indent}{var} = _req.data")
+        else:
+            lines.append(f"{indent}{var} = " + _ARGS_SRC.format(p=p))
+        pos_vars.append(var)
+    kw_parts = []
+    for p in kw:
+        var = f"_{name}_kw_{p}"
+        lines.append(f"{indent}{var} = " + _ARGS_SRC.format(p=p))
+        kw_parts.append(f"{p}={var}")
+    if bytes_first and not pos and not kw:
+        # no declared params: hand the function raw bytes as its sole argument
+        lines = [f"{indent}_{name}_data = _req.data"]
+        return lines, f"{name}(_{name}_data)"
+    call = f"{name}({', '.join(pos_vars + kw_parts)})"
+    return lines, call
+
+
 def _build_args_string(funcs: list) -> str:
-    """
-    Wrapper type: args_string
-    All parameters of every function receive strings from request.args.
-    Variables are prefixed with the function name to avoid name collisions
-    when multiple functions share the same parameter name.
-    """
+    """args_string: every param receives a string from request.args."""
     indent = "    "
     body_lines = []
     first_result = None
-    for i, (func_name, param_names) in enumerate(funcs):
+    for i, (name, pos, kw) in enumerate(funcs):
         result_var = f"_r{i}"
         if first_result is None:
             first_result = result_var
-        arg_vars = []
-        for p in param_names:
-            var = f"_{func_name}_{p}"
-            body_lines.append(f"{indent}{var} = _req.args.get({p!r}, '')")
-            arg_vars.append(var)
-        call = f"{func_name}({', '.join(arg_vars)})"
+        lines, call = _emit_call(indent, name, pos, kw)
+        body_lines += lines
         body_lines.append(f"{indent}{result_var} = {call}")
     ret = f"str({first_result})" if first_result else "''"
     body_lines.append(f"{indent}return {ret}")
@@ -155,57 +181,34 @@ def _build_args_string(funcs: list) -> str:
 
 
 def _build_args_string_xss(funcs: list) -> str:
-    """
-    Wrapper type: args_string_xss (CWE-079 only)
-    All parameters of every function receive strings from request.args.
-    All results are concatenated and returned via make_response(text/html)
-    so CodeQL's ReflectedXss.ql recognises an explicit HTML sink.
+    """args_string_xss (CWE-079) — SOURCE-ONLY (v4).
+    Params receive request.args so the source reaches the function body, but the
+    return value is NOT rendered/returned (the wrapper returns a constant).
+    ReflectedXss.ql therefore fires only when the generated code has its OWN html
+    sink, making every 079 detection attributable to the code, not the harness.
     """
     indent = "    "
     body_lines = []
-    result_vars = []
-    for i, (func_name, param_names) in enumerate(funcs):
-        result_var = f"_r{i}"
-        result_vars.append(result_var)
-        arg_vars = []
-        for p in param_names:
-            var = f"_{func_name}_{p}"
-            body_lines.append(f"{indent}{var} = _req.args.get({p!r}, '')")
-            arg_vars.append(var)
-        call = f"{func_name}({', '.join(arg_vars)})"
-        body_lines.append(f"{indent}{result_var} = {call}")
-    combined = " + ".join(f"str({r})" for r in result_vars) if result_vars else "''"
-    body_lines.append(
-        f"{indent}return _mkr({combined}, 200, {{'Content-Type': 'text/html'}})"
-    )
-    return _FLASK_ROUTE_HEADER_XSS + "\n".join(body_lines) + "\n"
+    for name, pos, kw in funcs:
+        lines, call = _emit_call(indent, name, pos, kw)
+        body_lines += lines
+        body_lines.append(f"{indent}{call}")
+    body_lines.append(f"{indent}return ''")  # constant: harness is NOT an html sink
+    return _FLASK_ROUTE_HEADER + "\n".join(body_lines) + "\n"
 
 
 def _build_bytes_first(funcs: list) -> str:
-    """
-    Wrapper type: bytes_first (CWE-502)
-    First parameter of each function receives raw bytes from request.data.
-    Remaining parameters receive strings from request.args.
-    """
+    """bytes_first (CWE-502): first positional param = request.data (bytes),
+    remaining params = request.args strings."""
     indent = "    "
     body_lines = []
     first_result = None
-    for i, (func_name, param_names) in enumerate(funcs):
+    for i, (name, pos, kw) in enumerate(funcs):
         result_var = f"_r{i}"
         if first_result is None:
             first_result = result_var
-        if not param_names:
-            body_lines.append(f"{indent}_data{i} = _req.data")
-            call = f"{func_name}(_data{i})"
-        else:
-            first_p = param_names[0]
-            body_lines.append(f"{indent}_{func_name}_{first_p} = _req.data")
-            arg_vars = [f"_{func_name}_{first_p}"]
-            for p in param_names[1:]:
-                var = f"_{func_name}_{p}"
-                body_lines.append(f"{indent}{var} = _req.args.get({p!r}, '')")
-                arg_vars.append(var)
-            call = f"{func_name}({', '.join(arg_vars)})"
+        lines, call = _emit_call(indent, name, pos, kw, bytes_first=True)
+        body_lines += lines
         body_lines.append(f"{indent}{result_var} = {call}")
     ret = f"str({first_result})" if first_result else "''"
     body_lines.append(f"{indent}return {ret}")

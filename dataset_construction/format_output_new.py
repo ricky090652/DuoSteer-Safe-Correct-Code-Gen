@@ -63,8 +63,12 @@ def extract_ids(input_file, output_file, source_dir=None):
 
             for loc in result.get("locations", []):
                 uri = loc.get("physicalLocation", {}).get("artifactLocation", {}).get("uri", "")
-                start_line = loc.get("physicalLocation", {}).get("region", {}).get("startLine", 0)
-                start_column = loc.get("physicalLocation", {}).get("region", {}).get("startColumn", "")
+                region = loc.get("physicalLocation", {}).get("region", {})
+                # int or null (never "" / 0 placeholders): keeps the JSON schema type-consistent
+                start_line = region.get("startLine")
+                start_line = int(start_line) if start_line not in (None, "") else None
+                start_column = region.get("startColumn")
+                start_column = int(start_column) if start_column not in (None, "") else None
 
                 if not uri:
                     continue
