@@ -1,0 +1,10 @@
+.git
+.env
+__pycache__/
+*.pyc
+results/
+checkpoints/
+codeql_db/
+hf_home/
+*.sarif
+data/

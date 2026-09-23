@@ -1,0 +1,26 @@
+services:
+  duosteer:
+    build: .
+    image: duosteer:py39
+    container_name: duosteer
+    # Keeps the container alive; attach with `docker compose exec duosteer bash`.
+    command: sleep infinity
+    working_dir: /workspace
+    volumes:
+      # Repo (code, data/, results/) shared with the host, so outputs persist.
+      - .:/workspace
+      # Hugging Face model cache, so models are not re-downloaded per container.
+      - ${HF_CACHE_DIR:-~/.cache/huggingface}:/root/.cache/huggingface
+    # OPENAI_API_KEY, HF_TOKEN, ... (.env is already gitignored).
+    env_file:
+      - path: .env
+        required: false
+    shm_size: 16gb
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              # Pin GPUs with e.g. `device_ids: ["0"]` instead of `count`.
+              count: 1
+              capabilities: [gpu]
