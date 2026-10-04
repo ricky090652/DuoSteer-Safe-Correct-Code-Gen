@@ -87,14 +87,20 @@ def make_split_indices(
     Group row indices by question (src_id), shuffle at question level, split.
     Guarantees no question appears in both train and val.
 
-    Uses src_id (question-level key) when available in metadata; falls back to
-    the pair id. Augmented datasets mix safe_only and cross_group pairs from the
-    same question — src_id ensures both go to the same split.
+    Groups by src_id (question-level key written by extract_representations.py).
+    There is no fallback to the pair id: one question backs many pairs, so a
+    pair-level split would leak questions into validation.
     """
+    missing = sum(1 for pair in metadata["pairs"] if not pair.get("src_id"))
+    if missing:
+        raise ValueError(
+            f"{missing} pairs in metadata.json have no src_id; a pair-level split "
+            "would leak questions. Re-run extract_representations.py to regenerate it."
+        )
+
     question_to_indices: defaultdict[str, list[int]] = defaultdict(list)
     for pair in metadata["pairs"]:
-        key = pair.get("src_id") or pair["id"]
-        question_to_indices[key].append(pair["index"])
+        question_to_indices[pair["src_id"]].append(pair["index"])
 
     question_ids = list(question_to_indices.keys())
     rng = random.Random(seed)
@@ -501,10 +507,11 @@ def main(args):
 
     train_idx, val_idx = make_split_indices(metadata, args.val_ratio, args.seed)
 
-    # Verify no leakage
-    train_qids = {p["id"] for p in metadata["pairs"] if p["index"] in set(train_idx)}
-    val_qids   = {p["id"] for p in metadata["pairs"] if p["index"] in set(val_idx)}
-    assert len(train_qids & val_qids) == 0, "Question ID leakage detected!"
+    # Verify no question appears in both splits
+    train_set, val_set = set(train_idx), set(val_idx)
+    train_qids = {p["src_id"] for p in metadata["pairs"] if p["index"] in train_set}
+    val_qids   = {p["src_id"] for p in metadata["pairs"] if p["index"] in val_set}
+    assert len(train_qids & val_qids) == 0, "Question leakage detected!"
 
     print(f"Train              : {len(train_idx)} pairs  ({len(train_qids)} questions)")
     print(f"Val                : {len(val_idx)} pairs  ({len(val_qids)} questions)")

@@ -58,6 +58,7 @@ Note: full sequences are used without truncation to preserve complete responses.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -361,6 +362,19 @@ def _cwe_key(cwe_id: str) -> str:
     return str(cwe_id).lower().removeprefix("cwe-").lstrip("0") or "0"
 
 
+def question_group_id(pair: dict) -> str:
+    """
+    Question-level grouping key for the probe train/val split.
+
+    The released pair files carry no `src_id`, and one question backs many
+    pairs, so falling back to the per-pair `id` would leak questions across
+    splits. Use `src_id` when present, else a hash of the question text.
+    """
+    if pair.get("src_id"):
+        return str(pair["src_id"])
+    return "q_" + hashlib.sha1(pair["question"].encode("utf-8")).hexdigest()[:16]
+
+
 def load_pairs(input_file: Path, cwe_id: str, max_pairs: int | None) -> list[dict]:
     pairs = []
     target = _cwe_key(cwe_id)
@@ -512,7 +526,7 @@ def main(args):
             {
                 "index":            idx,
                 "id":               p["id"],
-                "src_id":           p.get("src_id"),
+                "src_id":           question_group_id(p),
                 "source":           p.get("source"),
                 "codeql_detections": p.get("vuln_codeql_detections", []),
             }
