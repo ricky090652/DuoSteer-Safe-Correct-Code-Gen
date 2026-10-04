@@ -5,7 +5,7 @@ FROM python:3.9-slim
 
 # PyTorch wheel index. cu121 works with host drivers >= 530; switch to cu118
 # for older drivers (check `nvidia-smi` on the server).
-ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
 # Versions used in the paper (see README.md / dataset_construction/README.md).
 ARG CODEQL_VERSION=2.25.2
 ARG PYTHON_QUERIES_VERSION=1.8.0
@@ -15,12 +15,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl unzip git ca-certificates tmux \
+    curl unzip git ca-certificates tmux \
     && rm -rf /var/lib/apt/lists/*
 
 # CodeQL CLI + codeql/python-queries pack (downloaded to /root/.codeql/packages).
 RUN curl -fsSL -o /tmp/codeql.zip \
-        https://github.com/github/codeql-cli-binaries/releases/download/v${CODEQL_VERSION}/codeql-linux64.zip \
+    https://github.com/github/codeql-cli-binaries/releases/download/v${CODEQL_VERSION}/codeql-linux64.zip \
     && unzip -q /tmp/codeql.zip -d /opt \
     && rm /tmp/codeql.zip \
     && /opt/codeql/codeql pack download codeql/python-queries@${PYTHON_QUERIES_VERSION}
