@@ -58,7 +58,6 @@ Note: full sequences are used without truncation to preserve complete responses.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import re
 import sys
@@ -74,6 +73,7 @@ from common.prompts import (
     CODE_GENERATION_PROMPT,
     CODE_GENERATION_PROMPT_WITH_VULNERABILITY_GENERIC,
 )
+from common.utils import question_group_id
 
 
 # --------------------------------------------------------------------------- #
@@ -360,19 +360,6 @@ def extract_batch(
 def _cwe_key(cwe_id: str) -> str:
     """Normalize a CWE id for comparison: 'cwe-022', 'CWE-22', '022', '22' -> '22'."""
     return str(cwe_id).lower().removeprefix("cwe-").lstrip("0") or "0"
-
-
-def question_group_id(pair: dict) -> str:
-    """
-    Question-level grouping key for the probe train/val split.
-
-    The released pair files carry no `src_id`, and one question backs many
-    pairs, so falling back to the per-pair `id` would leak questions across
-    splits. Use `src_id` when present, else a hash of the question text.
-    """
-    if pair.get("src_id"):
-        return str(pair["src_id"])
-    return "q_" + hashlib.sha1(pair["question"].encode("utf-8")).hexdigest()[:16]
 
 
 def load_pairs(input_file: Path, cwe_id: str, max_pairs: int | None) -> list[dict]:

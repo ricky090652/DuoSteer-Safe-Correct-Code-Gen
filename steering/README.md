@@ -37,8 +37,10 @@ python steering/steer_eval.py \
 The correctness vector is estimated on the distribution where it will act: safety-steered outputs that are CodeQL-safe, contrasting functionally correct vs incorrect ones.
 
 ```bash
-# 3a. Training prompts per CWE (deduplicated, disjoint from the evaluation set)
+# 3a. Training prompts per CWE (one task per question, disjoint from the evaluation set)
 #     -> data/double_steering/tasks/train_tasks_cwe-022.jsonl, ...
+#     --pair_prefix qwen25-coder-7b selects another model's pairs; --cross_for_all
+#     also draws cross-pair questions for CWE-022/079 (small Qwen intra pools)
 python steering/prepare_correctness_prompts.py
 
 # 3b. Safety-only steered outputs on those prompts, one output directory per
@@ -55,7 +57,7 @@ python steering/steer_eval.py \
 # 3c. Quality filter (code fence, length, ast.parse) over every <cwe>/<config>/*.jsonl
 python steering/filter_steered.py
 
-# 3d. Keep only CodeQL-safe outputs
+# 3d. Keep only CodeQL-safe outputs (--base_dir moves the whole tree, e.g. data/double_steering/qwen)
 python steering/codeql_filter.py --cwe cwe-022   # repeat per CWE
 
 # 3e. GPT-4.1 correctness labels via the OpenAI Batch API
@@ -64,7 +66,8 @@ python steering/correctness_batch_prepare.py
 python steering/correctness_batch_submit.py
 python steering/correctness_batch_collect.py
 
-# 3f. Build (safe-and-correct, safe-but-incorrect) pairs
+# 3f. Build (safe-and-correct, safe-but-incorrect) pairs, grouped by question
+#     (--pair_target caps every CWE, e.g. 300 for Qwen)
 python steering/build_correctness_pairs.py
 ```
 

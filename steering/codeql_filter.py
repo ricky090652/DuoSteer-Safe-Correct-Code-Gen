@@ -5,8 +5,12 @@ For each CWE, extracts Python code into per-condition subfolders, runs
 CodeQL with the target-CWE query only, and annotates every filtered record
 with codeql_pass/fail. Outputs a merged codeql_annotated.jsonl per CWE.
 
+All paths live under --base_dir (default data/double_steering):
+  {base_dir}/filtered, codeql_input, codeql_db, codeql_results.
+
 Usage (one run per CWE):
     python codeql_filter.py --cwe cwe-022
+    python codeql_filter.py --cwe cwe-022 --base_dir data/double_steering/qwen
     python codeql_filter.py --cwe cwe-022 --dry_run
 """
 
@@ -40,10 +44,19 @@ CWE_QUERIES = {
     "cwe-502": "CWE-502/UnsafeDeserialization.ql",
 }
 
+# Set from --base_dir in main().
 FILTERED_BASE  = Path("data/double_steering/filtered")
 CODEQL_IN_BASE = Path("data/double_steering/codeql_input")
 CODEQL_DB_BASE = Path("data/double_steering/codeql_db")
 CODEQL_RES_BASE = Path("data/double_steering/codeql_results")
+
+
+def set_base_dir(base_dir: Path) -> None:
+    global FILTERED_BASE, CODEQL_IN_BASE, CODEQL_DB_BASE, CODEQL_RES_BASE
+    FILTERED_BASE   = base_dir / "filtered"
+    CODEQL_IN_BASE  = base_dir / "codeql_input"
+    CODEQL_DB_BASE  = base_dir / "codeql_db"
+    CODEQL_RES_BASE = base_dir / "codeql_results"
 
 
 def extract_code(text: str) -> str:
@@ -242,7 +255,11 @@ def main():
                         help="Path to the CodeQL CLI binary (default: $CODEQL_BIN or 'codeql')")
     parser.add_argument("--qlpack_base", default=None,
                         help="Path to the CodeQL python-queries Security directory (default: $CODEQL_QLPACK)")
+    parser.add_argument("--base_dir", default="data/double_steering",
+                        help="Pipeline root holding filtered/ and the codeql_* dirs "
+                             "(e.g. data/double_steering/qwen)")
     args = parser.parse_args()
+    set_base_dir(Path(args.base_dir))
     global CODEQL_BIN, QLPACK_BASE
     if args.codeql:
         CODEQL_BIN = args.codeql

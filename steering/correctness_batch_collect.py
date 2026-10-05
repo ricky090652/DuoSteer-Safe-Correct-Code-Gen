@@ -160,7 +160,7 @@ def check_and_collect(client: OpenAI, cwe: str) -> bool:
                 "condition":    meta["condition"] or orig.get("condition", ""),
                 "alpha":        orig.get("alpha") or orig.get(
                                     "steering_info", {}).get("alpha"),
-                "src_id":       orig.get("src_id", rid),
+                "src_id":       orig.get("src_id"),  # question-level; no id fallback
                 "codeql_pass":  True,
                 "gpt41_correct": correct,
                 "gpt41_severity": severity,

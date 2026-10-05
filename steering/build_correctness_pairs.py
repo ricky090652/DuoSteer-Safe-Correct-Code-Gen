@@ -11,6 +11,10 @@ Pairing rules:
 
 Pair targets match safety steering pair counts (min 400):
   cwe-022=541, cwe-079=688, cwe-094=867, cwe-295=644, cwe-502=722
+Override with --pair_target (e.g. 300 for Qwen-2.5-Coder, as in the paper).
+
+Every labeled record must carry a question-level src_id (written by
+prepare_correctness_prompts.py); there is no fallback to the record id.
 """
 
 import argparse
@@ -64,6 +68,12 @@ def load_labeled(cwe: str) -> list:
             r = json.loads(line)
             if r.get("codeql_pass") and r.get("gpt41_correct") is not None:
                 records.append(r)
+    missing = sum(1 for r in records if not r.get("src_id"))
+    if missing:
+        raise ValueError(
+            f"{cwe}: {missing} labeled records have no src_id; grouping by record id "
+            "would split questions across pairs and leak them into val. Regenerate "
+            "the tasks with prepare_correctness_prompts.py and rerun the pipeline.")
     return records
 
 
@@ -96,7 +106,7 @@ def build_pairs(records: list, cwe: str, rng: random.Random) -> list:
 
     by_q: dict[str, dict] = defaultdict(lambda: {"correct": [], "incorrect": []})
     for rec in records:
-        sid = rec.get("src_id") or rec["id"]
+        sid = rec["src_id"]
         pool = "correct" if rec["gpt41_correct"] else "incorrect"
         by_q[sid][pool].append(rec)
 
@@ -203,7 +213,7 @@ def verify_pairs(pairs: list, cwe: str, split: str):
 
 
 def main():
-    global LABEL_BASE, OUT_DIR, CWES, VAL_RATIO, SEED
+    global LABEL_BASE, OUT_DIR, CWES, VAL_RATIO, SEED, PAIR_TARGETS
     ap = argparse.ArgumentParser(
         description="Build (safe-and-correct, safe-but-incorrect) correctness "
                     "contrastive pairs from GPT-4.1 labeled steered generations.")
@@ -215,12 +225,16 @@ def main():
     ap.add_argument("--val_ratio", type=float, default=0.20,
                     help="Question-level validation split ratio")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--pair_target", type=int, default=None,
+                    help="Pair cap for every CWE (default: per-CWE PAIR_TARGETS)")
     args = ap.parse_args()
     LABEL_BASE = Path(args.label_base)
     OUT_DIR = Path(args.out_dir)
     CWES = args.cwes
     VAL_RATIO = args.val_ratio
     SEED = args.seed
+    if args.pair_target is not None:
+        PAIR_TARGETS = {cwe: args.pair_target for cwe in ALL_CWES}
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     rng = random.Random(SEED)
@@ -232,7 +246,7 @@ def main():
             continue
 
         target = PAIR_TARGETS[cwe]
-        n_src     = len({r.get("src_id") or r["id"] for r in records})
+        n_src     = len({r["src_id"] for r in records})
         n_correct = sum(1 for r in records if r["gpt41_correct"])
         n_incorr  = sum(1 for r in records if not r["gpt41_correct"])
         print(f"{cwe}: {len(records)} labeled records  "
