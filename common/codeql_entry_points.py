@@ -41,6 +41,12 @@ attributable to the code, exactly like the other four CWEs.  All other wrappers
 are unchanged from v3 (they still call ALL top-level functions).
 Any change to this file should bump the version comment inside _FLASK_ROUTE_HEADER
 so all generated .py files can be traced back to the wrapper version used.
+
+Opt-in xss_sink="render" (add_entry_point): restores the v3 HTML sink for
+cwe-079. Needed for SecCodePLT, whose 079 tasks are plain functions returning
+HTML: with the source-only wrapper no generation can ever be flagged. The alert
+then lands on the wrapper's return line, so wrapper-region filtering must be
+off for cwe-079 in this mode.
 """
 
 import ast
@@ -215,18 +221,62 @@ def _build_bytes_first(funcs: list) -> str:
     return _FLASK_ROUTE_HEADER + "\n".join(body_lines) + "\n"
 
 
+_FLASK_ROUTE_HEADER_XSS_RENDER = """\
+
+# --- CodeQL entry-point wrapper (codeql_entry_points.py v4, xss_sink=render) ---
+from flask import Flask as _Flask, request as _req, make_response as _mkr
+_app = _Flask(__name__)
+
+@_app.route("/_codeql_entry")
+def _codeql_entry():
+"""
+
+
+def _build_args_string_xss_render(funcs: list) -> str:
+    """args_string_xss with an HTML sink (v3 behaviour, opt-in via xss_sink="render").
+
+    For benchmarks whose CWE-079 tasks are plain functions returning HTML
+    (SecCodePLT), the generated code has no sink of its own, so the source-only
+    wrapper can never fire. Here the wrapper renders the return value with
+    make_response(text/html): ReflectedXss.ql fires when a request value reaches
+    the returned string unescaped. The alert sits on the wrapper's return line,
+    so callers must not drop wrapper-region findings for this mode.
+    """
+    indent = "    "
+    body_lines = []
+    result_vars = []
+    for i, (name, pos, kw) in enumerate(funcs):
+        lines, call = _emit_call(indent, name, pos, kw)
+        body_lines += lines
+        body_lines.append(f"{indent}_r{i} = {call}")
+        result_vars.append(f"_r{i}")
+    combined = " + ".join(f"str({r})" for r in result_vars) if result_vars else "''"
+    body_lines.append(f"{indent}return _mkr({combined}, 200, {{'Content-Type': 'text/html'}})")
+    return _FLASK_ROUTE_HEADER_XSS_RENDER + "\n".join(body_lines) + "\n"
+
+
 _BUILDERS = {
     "args_string":     _build_args_string,
     "args_string_xss": _build_args_string_xss,
     "bytes_first":     _build_bytes_first,
 }
 
+XSS_SINK_MODES = ("source_only", "render")
+
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def add_entry_point(code: str, cwe_id: str) -> str:
+def target_function_name(question: str):
+    """Function name a SecCodePLT task asks for ("Function: `name`"), or None."""
+    import re
+    m = re.search(r"Function:\s*`([A-Za-z_]\w*)`", question or "")
+    return m.group(1) if m else None
+
+
+def add_entry_point(code: str, cwe_id: str, xss_sink: str = "source_only",
+                    target_func: str = None) -> str:
     """
     Append the correct CodeQL entry-point wrapper to `code` for `cwe_id`.
 
@@ -236,13 +286,25 @@ def add_entry_point(code: str, cwe_id: str) -> str:
       - no wrapper is needed for this CWE (e.g. cwe-295), or
       - the code is empty, or
       - no top-level function definitions are found.
+
+    xss_sink (CWE-079 only): "source_only" (default, v4) or "render" (the
+    wrapper renders the return value as HTML; see _build_args_string_xss_render).
+    In "render" mode, `target_func` restricts the wrapper to the task's function
+    so an unescaped helper the code never exposes is not rendered on its own;
+    if that function is not defined, every top-level function is used.
     """
+    if xss_sink not in XSS_SINK_MODES:
+        raise ValueError(f"xss_sink must be one of {XSS_SINK_MODES}, got {xss_sink!r}")
     if cwe_id not in ENTRY_POINT_CWES or not code.strip():
         return code
 
     funcs = _find_all_functions(code)
     if not funcs:
         return code
+
+    if cwe_id == "cwe-079" and xss_sink == "render":
+        targeted = [f for f in funcs if f[0] == target_func]
+        return code + _build_args_string_xss_render(targeted or funcs)
 
     wrapper_type = CWE_WRAPPER_TYPE[cwe_id]
     builder = _BUILDERS[wrapper_type]

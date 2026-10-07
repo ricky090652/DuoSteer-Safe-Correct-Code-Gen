@@ -35,7 +35,7 @@ import sys
 import warnings
 from pathlib import Path
 
-from codeql_entry_points import add_entry_point
+from codeql_entry_points import XSS_SINK_MODES, add_entry_point, target_function_name
 
 CODEQL_BIN = os.environ.get("CODEQL_BIN", "codeql")
 QLBASE = Path(os.environ.get("CODEQL_QLPACK", ""))
@@ -53,6 +53,7 @@ ALL_CWES = list(CWE_QUERIES.keys())
 STEER_BASE = Path("results/steering")
 SRC_BASE = Path("data/codeql/steered")
 OUT_BASE = Path("results/codeql_steered")
+XSS_SINK = "source_only"  # CWE-079 wrapper mode, set from --xss_sink
 # CLI may override these via --steer_base/--src_base/--out_base.
 
 FENCE_RE = re.compile(r"```(?:python)?\s*\n?(.*?)\n?```", re.DOTALL)
@@ -102,7 +103,8 @@ def write_code_files(cwe: str, mode: str) -> dict[str, dict]:
                 code = strip_fences(pred)
                 if not syntax_ok(code):
                     continue
-                wrapped = add_entry_point(code, cwe)
+                wrapped = add_entry_point(code, cwe, xss_sink=XSS_SINK,
+                                          target_func=target_function_name(rec.get("question", "")))
                 py = subdir / f"{safe_name(rec['id'])}.py"
                 py.write_text(wrapped)
                 written[(mode, condition, rec["id"])] = py
@@ -141,8 +143,10 @@ def run_codeql(cwe: str, dry_run: bool) -> Path:
 
     json_out = out_dir / "issues_target.json"
     parse = [sys.executable, str(FORMAT_SCRIPT), "-i", str(sarif), "-o", str(json_out)]
-    # all CWEs incl. 079 (wrapper v4 is source-only): drop wrapper-region findings
-    parse += ["--source_dir", str(src_root)]
+    # Drop wrapper-region findings, except CWE-079 in render mode, where the
+    # wrapper's make_response is the sink and the alert lands on it by design.
+    if not (cwe == "cwe-079" and XSS_SINK == "render"):
+        parse += ["--source_dir", str(src_root)]
     subprocess.run(parse, check=True)
     return json_out
 
@@ -162,7 +166,7 @@ def detected_files(json_path: Path) -> set[str]:
 
 
 def main():
-    global STEER_BASE, SRC_BASE, OUT_BASE
+    global STEER_BASE, SRC_BASE, OUT_BASE, XSS_SINK
     parser = argparse.ArgumentParser()
     parser.add_argument("--cwe", nargs="+", default=ALL_CWES)
     parser.add_argument("--mode", nargs="+", default=["safety_only", "double_A"])
@@ -170,6 +174,9 @@ def main():
     parser.add_argument("--src_base", default=str(SRC_BASE))
     parser.add_argument("--out_base", default=str(OUT_BASE))
     parser.add_argument("--dry_run", action="store_true")
+    parser.add_argument("--xss_sink", choices=XSS_SINK_MODES, default="source_only",
+                        help="CWE-079 wrapper: source_only (v4 default) or render (HTML sink "
+                             "on the return value; needed for SecCodePLT's plain-function tasks)")
     parser.add_argument("--codeql", default=None,
                         help="Path to the CodeQL CLI binary (default: $CODEQL_BIN or 'codeql')")
     parser.add_argument("--qlpack_base", default=None,
@@ -185,6 +192,7 @@ def main():
     STEER_BASE = Path(args.steer_base)
     SRC_BASE = Path(args.src_base)
     OUT_BASE = Path(args.out_base)
+    XSS_SINK = args.xss_sink
 
     summary = {}   # {cwe: {mode: {condition: {n_total, n_vuln, vuln_rate}}}}
 

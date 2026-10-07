@@ -31,7 +31,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from codeql_entry_points import add_entry_point
+from codeql_entry_points import XSS_SINK_MODES, add_entry_point, target_function_name
 
 CODEQL_BIN  = os.environ.get("CODEQL_BIN", "codeql")
 QLPACK_BASE = os.environ.get("CODEQL_QLPACK", "")
@@ -49,6 +49,7 @@ FILTERED_BASE  = Path("data/double_steering/filtered")
 CODEQL_IN_BASE = Path("data/double_steering/codeql_input")
 CODEQL_DB_BASE = Path("data/double_steering/codeql_db")
 CODEQL_RES_BASE = Path("data/double_steering/codeql_results")
+XSS_SINK = "source_only"  # CWE-079 wrapper mode, set from --xss_sink
 
 
 def set_base_dir(base_dir: Path) -> None:
@@ -96,7 +97,8 @@ def extract_code_files(cwe: str) -> dict:
                         continue
                     code = rec.get("extracted_code") or extract_code(
                         rec.get("predicted_code", ""))
-                    code = add_entry_point(code, cwe)
+                    code = add_entry_point(code, cwe, xss_sink=XSS_SINK,
+                                           target_func=target_function_name(rec.get("question", "")))
                     fname = safe_filename(rec["id"])
                     py_path = out_dir / fname
                     py_path.write_text(code)
@@ -258,8 +260,13 @@ def main():
     parser.add_argument("--base_dir", default="data/double_steering",
                         help="Pipeline root holding filtered/ and the codeql_* dirs "
                              "(e.g. data/double_steering/qwen)")
+    parser.add_argument("--xss_sink", choices=XSS_SINK_MODES, default="source_only",
+                        help="CWE-079 wrapper: source_only (v4 default) or render (HTML sink "
+                             "on the return value). Alerts are counted anywhere in the file.")
     args = parser.parse_args()
     set_base_dir(Path(args.base_dir))
+    global XSS_SINK
+    XSS_SINK = args.xss_sink
     global CODEQL_BIN, QLPACK_BASE
     if args.codeql:
         CODEQL_BIN = args.codeql
