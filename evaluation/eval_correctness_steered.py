@@ -8,9 +8,9 @@ Writes per-cwe labeled outputs and a summary JSON of correctness rates per
 (mode, condition).
 
 Subcommands (same as eval_correctness_seccodeplt.py):
-  prepare  --steer_base RESULTS_ROOT  --out_dir BATCH_DIR
+  prepare  --steer_base RESULTS_ROOT  --out_dir BATCH_DIR  [--cwes cwe-079 ...]
   submit   --out_dir BATCH_DIR
-  collect  --steer_base RESULTS_ROOT  --out_dir BATCH_DIR
+  collect  --steer_base RESULTS_ROOT  --out_dir BATCH_DIR  [--cwes cwe-079 ...]
 
 Example:
   python eval_correctness_steered.py prepare \
@@ -93,11 +93,11 @@ def parse_gpt_response(content):
     return correct, severity, content
 
 
-def iter_steer_files(steer_base, modes):
-    """Yield (mode, cwe, condition, path) for every condition JSONL."""
+def iter_steer_files(steer_base, modes, cwes=None):
+    """Yield (mode, cwe, condition, path) for every condition JSONL of the given CWEs."""
     base = Path(steer_base)
     for mode_dir in (m for m in modes if (base / m).is_dir()):
-        for cwe in CWES:
+        for cwe in (cwes or CWES):
             cwe_dir = base / mode_dir / cwe
             if not cwe_dir.is_dir():
                 continue
@@ -113,7 +113,7 @@ def cmd_prepare(args):
     n = 0
     per_cwe = defaultdict(int)
     with open(out_path, "w") as fout:
-        for mode, cwe, cond, fpath in iter_steer_files(args.steer_base, args.modes):
+        for mode, cwe, cond, fpath in iter_steer_files(args.steer_base, args.modes, args.cwes):
             with open(fpath) as fin:
                 for line in fin:
                     if not line.strip():
@@ -139,7 +139,7 @@ def cmd_prepare(args):
                     n += 1
                     per_cwe[cwe] += 1
     print(f"prepared {n} batch records → {out_path}")
-    for c in CWES:
+    for c in args.cwes:
         print(f"  {c}: {per_cwe[c]}")
 
 
@@ -193,7 +193,7 @@ def cmd_collect(args):
 
     # Build (mode, cwe, cond, id) -> orig record index
     idx = {}
-    for mode, cwe, cond, fpath in iter_steer_files(args.steer_base, args.modes):
+    for mode, cwe, cond, fpath in iter_steer_files(args.steer_base, args.modes, args.cwes):
         with open(fpath) as fin:
             for line in fin:
                 if not line.strip():
@@ -214,6 +214,8 @@ def cmd_collect(args):
             if len(parts) != 4:
                 continue
             mode, cwe, cond, rid = parts
+            if cwe not in args.cwes:
+                continue  # batch may hold other CWEs; label only the requested ones
             body = resp.get("response", {}).get("body", {})
             content = ""
             if body.get("choices"):
@@ -260,6 +262,8 @@ def main():
         if name != "submit":
             sp.add_argument("--steer_base", required=True)
             sp.add_argument("--modes", nargs="+", default=["safety_only", "double_A"])
+            sp.add_argument("--cwes", nargs="+", default=CWES, choices=CWES,
+                            help="Only these CWEs (default: all five)")
     args = p.parse_args()
     {"prepare": cmd_prepare, "submit": cmd_submit, "collect": cmd_collect}[args.cmd](args)
 
