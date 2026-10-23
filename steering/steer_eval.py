@@ -67,6 +67,19 @@ SETTINGS AND HOW THE STEERING WORKS
     scale_vuln = -s) simultaneously amplifies safety circuits and
     inverts vulnerability circuits.
 
+  head_scale
+    Multiplicative scaling with knockout-derived directions; no vector.
+    Top-k safe-promoting heads (most negative delta) are amplified and the
+    top-k_vuln vuln-promoting heads (most positive delta) are attenuated:
+
+        x[safe_head]  ←  x[safe_head] × (1 + β)
+        x[vuln_head]  ←  x[vuln_head] × (1 − β_vuln)
+
+    Knockout is the factor-0 case, so to first order the safe-vs-vuln margin
+    moves by (1 − factor)·Δ, i.e. both sides push toward safe code.  Sweep with
+    --top_k_list / --beta_list / --vuln_k_list / --vuln_beta_list; k = 0
+    disables that side.  Not part of --setting all.
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 LAYER INDEX CONVENTION
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -495,6 +508,16 @@ def select_suppress_heads(ranked_causal: list[dict], k: int) -> tuple[list[dict]
     return safe_heads, vuln_heads
 
 
+def select_vuln_heads(ranked_causal: list[dict], k: int) -> list[dict]:
+    """Top-k vuln-promoting heads: most positive delta_vs_baseline first."""
+    by_delta = sorted(
+        ranked_causal,
+        key=lambda r: r.get("delta_vs_baseline", r.get("mean_delta", 0)),
+        reverse=True,
+    )
+    return by_delta[:k]
+
+
 def _head_label(h: dict) -> str:
     return f"L{h['layer']:02d}H{h['head']:02d}"
 
@@ -612,6 +635,10 @@ def make_output_filename(setting: str, args, sv_method: str = "unknown") -> str:
             f"_safe{half}x{args.scale_safe:.1f}"
             f"_vuln{half}x{args.scale_vuln:.1f}{tag}.jsonl"
         )
+    if setting == "head_scale":
+        safe = f"safe{args.top_k}x{1 + args.beta:.2f}" if args.top_k else "safe0"
+        vuln = f"vuln{args.vuln_k}x{1 - args.vuln_beta:.2f}" if args.vuln_k else "vuln0"
+        return f"head_scale_{safe}_{vuln}{tag}.jsonl"
     raise ValueError(f"Unknown setting: {setting!r}")
 
 
@@ -735,6 +762,41 @@ def run_setting(
         print(f"  safe=[{', '.join(_head_label(t) for t in safe_targets)}]  ×{args.scale_safe}")
         print(f"  vuln=[{', '.join(_head_label(t) for t in vuln_targets)}]  ×{args.scale_vuln}")
 
+    elif setting == "head_scale":
+        ranked_causal, rtype = load_head_results(args.head_results)
+        if rtype != "causal":
+            raise ValueError("'head_scale' needs head_causal_results.json (delta-ranked).")
+        safe_targets = select_safe_heads(ranked_causal, args.top_k) if args.top_k else []
+        vuln_targets = select_vuln_heads(ranked_causal, args.vuln_k) if args.vuln_k else []
+
+        def _delta(h):
+            return h.get("delta_vs_baseline", h.get("mean_delta", 0))
+        bad = [_head_label(h) for h in safe_targets if _delta(h) >= 0] + \
+              [_head_label(h) for h in vuln_targets if _delta(h) <= 0]
+        if bad:
+            print(f"  WARNING: heads with unexpected delta sign: {bad}")
+
+        f_safe, f_vuln = 1 + args.beta, 1 - args.vuln_beta
+        for t in safe_targets:
+            hooks.append(SuppressHead(model, t["layer"], t["head"], head_dim, f_safe,
+                                      positions=pos))
+        for t in vuln_targets:
+            hooks.append(SuppressHead(model, t["layer"], t["head"], head_dim, f_vuln,
+                                      positions=pos))
+
+        steering_info.update({
+            "mode":         "head_scale",
+            "results_type": rtype,
+            "top_k":        args.top_k,
+            "beta":         args.beta,
+            "vuln_k":       args.vuln_k,
+            "vuln_beta":    args.vuln_beta,
+            "safe_targets": [_head_summary(t, rtype) for t in safe_targets],
+            "vuln_targets": [_head_summary(t, rtype) for t in vuln_targets],
+        })
+        print(f"  safe=[{', '.join(_head_label(t) for t in safe_targets)}]  ×{f_safe:.2f}")
+        print(f"  vuln=[{', '.join(_head_label(t) for t in vuln_targets)}]  ×{f_vuln:.2f}")
+
     # ---- Generate ----
     results = list(existing)
     try:
@@ -780,7 +842,7 @@ def main(args):
                 raise ValueError("--layer_idx or --layer_list required for 'layer' setting.")
             if not args.layer_steering_dir:
                 raise ValueError("--layer_steering_dir required for 'layer' setting.")
-        if s in ("head", "head_suppress"):
+        if s in ("head", "head_suppress", "head_scale"):
             if not args.head_results:
                 raise ValueError(f"--head_results required for '{s}' setting.")
         if s == "head":
@@ -840,6 +902,20 @@ def main(args):
                     print(f"\n-- top_k={top_k}  scale_safe={alpha}  scale_vuln={-alpha} --")
                     run_setting(setting, items, model, tokenizer, a, output_dir, head_dim)
 
+        elif setting == "head_scale":
+            for top_k in top_ks:
+                for beta in (args.beta_list if top_k else [0.0]):
+                    for vuln_k in args.vuln_k_list:
+                        for vuln_beta in (args.vuln_beta_list if vuln_k else [0.0]):
+                            if not top_k and not vuln_k:
+                                continue
+                            a = copy.copy(args)
+                            a.top_k, a.beta = top_k, beta
+                            a.vuln_k, a.vuln_beta = vuln_k, vuln_beta
+                            print(f"\n-- safe top_k={top_k} ×{1 + beta:.2f}"
+                                  f"  vuln k={vuln_k} ×{1 - vuln_beta:.2f} --")
+                            run_setting(setting, items, model, tokenizer, a, output_dir, head_dim)
+
     print(f"\nAll done.  Results in: {output_dir}")
 
 
@@ -862,7 +938,7 @@ if __name__ == "__main__":
 
     # Settings
     parser.add_argument("--setting", nargs="+", default=["all"],
-        choices=["all", "baseline", "layer", "head", "head_suppress"],
+        choices=["all", "baseline", "layer", "head", "head_suppress", "head_scale"],
         help=(
             "Intervention setting(s) to run (default: all).\n"
             "  baseline       no steering\n"
@@ -957,6 +1033,16 @@ if __name__ == "__main__":
     parser.add_argument("--top_k", type=int, default=1,
         help="Number of top safe-important heads to steer additively\n"
              "('head' and 'head_suppress', default: 1).")
+
+    # head_scale only
+    parser.add_argument("--beta_list", type=float, nargs="+", default=[0.5],
+        help="'head_scale': safe-promoting heads are scaled by (1 + β) (default: 0.5).")
+    parser.add_argument("--vuln_k_list", type=int, nargs="+", default=[0],
+        help="'head_scale': number of vuln-promoting heads to attenuate; 0 disables\n"
+             "(default: 0).  Use --top_k_list 0 for attenuation only.")
+    parser.add_argument("--vuln_beta_list", type=float, nargs="+", default=[0.5],
+        help="'head_scale': vuln-promoting heads are scaled by (1 − β_vuln);\n"
+             "1.0 = knockout (default: 0.5).")
 
     # head_suppress only
     parser.add_argument("--scale_safe", type=float, default=2.0,
