@@ -224,6 +224,25 @@ from prompts import CODE_GENERATION_PROMPT  # single prompt source, rendered at 
 # Activation hooks
 # --------------------------------------------------------------------------- #
 
+STEER_POSITIONS = ("all", "response")
+
+
+def _steer_positions(seq_len: int, positions: str) -> slice:
+    """
+    Sequence positions an intervention modifies in one forward call.
+
+    "all"      : every position, prompt included (original behaviour).
+    "response" : only positions that predict response tokens.  generate()
+                 with KV caching runs one prefill over the prompt (seq_len > 1)
+                 and then one token per step (seq_len == 1), so this keeps the
+                 last prefill position (it predicts the first response token)
+                 and every decode step.  Prompt KV entries stay unsteered.
+    """
+    if positions == "response" and seq_len > 1:
+        return slice(seq_len - 1, seq_len)
+    return slice(None)
+
+
 class SteerLayer:
     """
     Adds α·v to the residual stream after a transformer layer.
@@ -232,18 +251,23 @@ class SteerLayer:
     subsequent layers and all subsequent generated tokens.
 
     layer_idx : int  1-based (layer 1 = first transformer block)
+    positions : "all" | "response"  (see _steer_positions)
     """
 
-    def __init__(self, model, layer_idx: int, steering_vec: torch.Tensor, alpha: float):
-        self._sv     = steering_vec          # (hidden_dim,) float32, sigma-normed
-        self._alpha  = alpha
+    def __init__(self, model, layer_idx: int, steering_vec: torch.Tensor, alpha: float,
+                 positions: str = "all"):
+        self._sv        = steering_vec          # (hidden_dim,) float32, sigma-normed
+        self._alpha     = alpha
+        self._positions = positions
         # Convert 1-based → 0-based for Python list indexing
         self._handle = model.model.layers[layer_idx - 1].register_forward_hook(self._hook)
 
     def _hook(self, module, input, output):
         hidden = output[0] if isinstance(output, tuple) else output
         offset = (self._alpha * self._sv).to(hidden.device, hidden.dtype)
-        hidden = hidden + offset
+        pos    = _steer_positions(hidden.shape[1], self._positions)
+        hidden = hidden.clone()
+        hidden[:, pos, :] += offset
         return (hidden,) + output[1:] if isinstance(output, tuple) else hidden
 
     def remove(self):
@@ -261,6 +285,7 @@ class SteerHead:
         x[:, :, head_idx*head_dim : (head_idx+1)*head_dim]  +=  α · v
 
     layer_idx, head_idx : int  both 1-based
+    positions : "all" | "response"  (see _steer_positions)
     """
 
     def __init__(
@@ -271,11 +296,13 @@ class SteerHead:
         head_dim: int,
         steering_vec: torch.Tensor,   # (head_dim,) float32, sigma-normed
         alpha: float,
+        positions: str = "all",
     ):
-        self._head_idx = head_idx - 1   # convert to 0-based for slice arithmetic
-        self._head_dim = head_dim
-        self._sv       = steering_vec
-        self._alpha    = alpha
+        self._head_idx  = head_idx - 1   # convert to 0-based for slice arithmetic
+        self._head_dim  = head_dim
+        self._sv        = steering_vec
+        self._alpha     = alpha
+        self._positions = positions
 
         o_proj = _find_o_proj(model, layer_idx - 1)   # 0-based layer
         if o_proj is None:
@@ -287,8 +314,9 @@ class SteerHead:
         offset = (self._alpha * self._sv).to(x.device, x.dtype)
         start  = self._head_idx * self._head_dim
         end    = start + self._head_dim
+        pos    = _steer_positions(x.shape[1], self._positions)
         x      = x.clone()
-        x[:, :, start:end] += offset
+        x[:, pos, start:end] += offset
         return (x,)
 
     def remove(self):
@@ -306,6 +334,7 @@ class SuppressHead:
     scale_factor ∈ (0,1) →  partial attenuation
     scale_factor = 0.0  →  complete knockout
     scale_factor < 0   →  invert direction (vuln-promoting heads in H-Supp)
+    positions : "all" | "response"  (see _steer_positions)
     """
 
     def __init__(
@@ -315,10 +344,12 @@ class SuppressHead:
         head_idx: int,
         head_dim: int,
         scale_factor: float,
+        positions: str = "all",
     ):
         self._head_idx   = head_idx - 1   # 0-based
         self._head_dim   = head_dim
         self._scale      = scale_factor
+        self._positions  = positions
 
         o_proj = _find_o_proj(model, layer_idx - 1)
         if o_proj is None:
@@ -329,8 +360,9 @@ class SuppressHead:
         x     = inputs[0]
         start = self._head_idx * self._head_dim
         end   = start + self._head_dim
+        pos   = _steer_positions(x.shape[1], self._positions)
         x     = x.clone()
-        x[:, :, start:end] *= self._scale
+        x[:, pos, start:end] *= self._scale
         return (x,)
 
     def remove(self):
@@ -554,6 +586,7 @@ def generate_one(model, tokenizer, prompt: str, args) -> str:
         top_p=args.top_p             if args.do_sample else 1.0,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
+        use_cache=True,   # --steer_positions response relies on prefill + per-token decode
     )
     new_tokens = out[0][input_ids.shape[1]:]
     return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
@@ -566,16 +599,18 @@ def generate_one(model, tokenizer, prompt: str, args) -> str:
 def make_output_filename(setting: str, args, sv_method: str = "unknown") -> str:
     if setting == "baseline":
         return "baseline.jsonl"
+    # Tag response-only runs so they never resume into all-position files.
+    tag = "_resp" if getattr(args, "steer_positions", "all") == "response" else ""
     if setting == "layer":
-        return f"layer_L{args.layer_idx:02d}_{sv_method}_alpha{args.alpha:.1f}.jsonl"
+        return f"layer_L{args.layer_idx:02d}_{sv_method}_alpha{args.alpha:.1f}{tag}.jsonl"
     if setting == "head":
-        return f"head_top{args.top_k}_{sv_method}_alpha{args.alpha:.1f}.jsonl"
+        return f"head_top{args.top_k}_{sv_method}_alpha{args.alpha:.1f}{tag}.jsonl"
     if setting == "head_suppress":
         half = args.top_k // 2
         return (
             f"head_suppress_top{args.top_k}"
             f"_safe{half}x{args.scale_safe:.1f}"
-            f"_vuln{half}x{args.scale_vuln:.1f}.jsonl"
+            f"_vuln{half}x{args.scale_vuln:.1f}{tag}.jsonl"
         )
     raise ValueError(f"Unknown setting: {setting!r}")
 
@@ -632,13 +667,16 @@ def run_setting(
     # ---- Build hooks and steering_info ----
     hooks: list = []
     steering_info: dict = {"setting": setting}
+    pos = args.steer_positions
+    if setting != "baseline":
+        steering_info["steer_positions"] = pos
 
     if setting == "baseline":
         steering_info.update({"mode": None, "targets": []})
 
     elif setting == "layer":
         sv, sv_method, raw_norm = load_layer_sv(args.layer_steering_dir, args.layer_idx)
-        hooks.append(SteerLayer(model, args.layer_idx, sv, args.alpha))
+        hooks.append(SteerLayer(model, args.layer_idx, sv, args.alpha, positions=pos))
         steering_info.update({
             "mode":       "layer",
             "sv_method":  sv_method,
@@ -655,7 +693,8 @@ def run_setting(
         for t in targets:
             sv, sv_method, raw_norm = load_head_sv(args.head_steering_dir, t["layer"], t["head"])
             raw_norms.append(raw_norm)
-            hooks.append(SteerHead(model, t["layer"], t["head"], head_dim, sv, args.alpha))
+            hooks.append(SteerHead(model, t["layer"], t["head"], head_dim, sv, args.alpha,
+                                   positions=pos))
         mean_raw_norm = sum(raw_norms) / len(raw_norms) if raw_norms else 1.0
         steering_info.update({
             "mode":          "head",
@@ -678,9 +717,11 @@ def run_setting(
         safe_targets, vuln_targets = select_suppress_heads(ranked_causal, args.top_k)
 
         for t in safe_targets:
-            hooks.append(SuppressHead(model, t["layer"], t["head"], head_dim, args.scale_safe))
+            hooks.append(SuppressHead(model, t["layer"], t["head"], head_dim, args.scale_safe,
+                                      positions=pos))
         for t in vuln_targets:
-            hooks.append(SuppressHead(model, t["layer"], t["head"], head_dim, args.scale_vuln))
+            hooks.append(SuppressHead(model, t["layer"], t["head"], head_dim, args.scale_vuln,
+                                      positions=pos))
 
         steering_info.update({
             "mode":         "head_suppress",
@@ -852,6 +893,14 @@ if __name__ == "__main__":
         help="Sampling temperature (only with --do_sample, default: 1.0).")
     parser.add_argument("--top_p", type=float, default=1.0,
         help="Nucleus sampling p (only with --do_sample, default: 1.0).")
+
+    parser.add_argument("--steer_positions", choices=STEER_POSITIONS, default="all",
+        help=(
+            "Where interventions apply (default: all).\n"
+            "  all       every position, prompt included (original behaviour)\n"
+            "  response  last prompt position + every generated token; output\n"
+            "            files get a '_resp' suffix"
+        ))
 
     # Layer setting
     parser.add_argument("--layer_idx", type=int, default=None,

@@ -53,7 +53,7 @@ import torch
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
 from steer_eval import (
-    SteerHead, load_head_sv, load_head_results, select_safe_heads,
+    STEER_POSITIONS, SteerHead, load_head_sv, load_head_results, select_safe_heads,
     build_prompt, generate_one, get_head_config, load_model,
 )
 
@@ -83,6 +83,9 @@ def make_filename(method: str, alpha1: float, stk: int,
 # --------------------------------------------------------------------------- #
 
 def run_condition(items, model, tokenizer, hooks_fn, output_file: Path, args):
+    # Tag response-only runs so they never resume into all-position files.
+    if args.steer_positions == "response" and output_file.name != "baseline.jsonl":
+        output_file = output_file.with_name(output_file.stem + "_resp.jsonl")
     done_ids = set()
     existing = []
     if output_file.exists():
@@ -104,6 +107,8 @@ def run_condition(items, model, tokenizer, hooks_fn, output_file: Path, args):
         return
 
     hooks, steering_info = hooks_fn()
+    if hooks:
+        steering_info["steer_positions"] = args.steer_positions
     results = list(existing)
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -143,7 +148,8 @@ def run_safety_only(items, model, tokenizer, output_dir, args,
         hooks = []
         for t in targets:
             sv, _, _ = load_head_sv(args.safety_sv_dir, t["layer"], t["head"])
-            hooks.append(SteerHead(model, t["layer"], t["head"], head_dim, sv, alpha1))
+            hooks.append(SteerHead(model, t["layer"], t["head"], head_dim, sv, alpha1,
+                                   positions=args.steer_positions))
         info = {"method": "safety_only", "alpha1": alpha1, "safety_topk": stk}
         return hooks, info
 
@@ -165,10 +171,12 @@ def run_method_A(items, model, tokenizer, output_dir, args,
         hooks = []
         for t in safety_targets:
             sv, _, _ = load_head_sv(args.safety_sv_dir, t["layer"], t["head"])
-            hooks.append(SteerHead(model, t["layer"], t["head"], head_dim, sv, alpha1))
+            hooks.append(SteerHead(model, t["layer"], t["head"], head_dim, sv, alpha1,
+                                   positions=args.steer_positions))
         for t in correct_targets:
             sv, _, _ = load_head_sv(args.correct_sv_dir_orth, t["layer"], t["head"])
-            hooks.append(SteerHead(model, t["layer"], t["head"], head_dim, sv, alpha2))
+            hooks.append(SteerHead(model, t["layer"], t["head"], head_dim, sv, alpha2,
+                                   positions=args.steer_positions))
         info = {
             "method": "A", "alpha1": alpha1, "safety_topk": stk,
             "alpha2": alpha2, "correct_topk": ctk,
@@ -230,10 +238,12 @@ def run_method_B(items, model, tokenizer, output_dir, args,
         for t in targets:
             if t["safety_rank"] < sentinel:
                 sv, _, _ = load_head_sv(args.safety_sv_dir, t["layer"], t["head"])
-                hooks.append(SteerHead(model, t["layer"], t["head"], head_dim, sv, alpha1))
+                hooks.append(SteerHead(model, t["layer"], t["head"], head_dim, sv, alpha1,
+                                   positions=args.steer_positions))
             if t["correct_rank"] < sentinel:
                 sv, _, _ = load_head_sv(args.correct_sv_dir_orth, t["layer"], t["head"])
-                hooks.append(SteerHead(model, t["layer"], t["head"], head_dim, sv, alpha2))
+                hooks.append(SteerHead(model, t["layer"], t["head"], head_dim, sv, alpha2,
+                                   positions=args.steer_positions))
         info = {
             "method": "B", "alpha1": alpha1, "alpha2": alpha2,
             "joint_topk": jtk, "joint_targets": targets,
@@ -256,7 +266,8 @@ def run_method_C(items, model, tokenizer, output_dir, args,
         hooks = []
         for t in correct_targets:
             sv, _, _ = load_head_sv(args.correct_sv_dir_raw, t["layer"], t["head"])
-            hooks.append(SteerHead(model, t["layer"], t["head"], head_dim, sv, alpha2))
+            hooks.append(SteerHead(model, t["layer"], t["head"], head_dim, sv, alpha2,
+                                   positions=args.steer_positions))
         info = {"method": "C", "alpha2": alpha2, "correct_topk": ctk}
         return hooks, info
 
@@ -282,7 +293,8 @@ def run_method_D(items, model, tokenizer, output_dir, args,
                 missing += 1
                 continue
             sv = torch.load(sv_path, map_location="cpu")
-            hooks.append(SteerHead(model, t["layer"], t["head"], head_dim, sv, alpha))
+            hooks.append(SteerHead(model, t["layer"], t["head"], head_dim, sv, alpha,
+                                   positions=args.steer_positions))
         if missing:
             print(f"  [D] missing {missing}/{len(targets)} joint SV files")
         info = {"method": "D", "alpha": alpha, "topk": tk}
@@ -312,10 +324,12 @@ def run_method_E(items, model, tokenizer, output_dir, args,
         hooks = []
         for t in safety_targets:
             sv, _, _ = load_head_sv(args.safety_sv_dir, t["layer"], t["head"])
-            hooks.append(SteerHead(model, t["layer"], t["head"], head_dim, sv, alpha1))
+            hooks.append(SteerHead(model, t["layer"], t["head"], head_dim, sv, alpha1,
+                                   positions=args.steer_positions))
         for t in correct_targets:
             sv, _, _ = load_head_sv(args.correct_sv_dir_raw, t["layer"], t["head"])
-            hooks.append(SteerHead(model, t["layer"], t["head"], head_dim, sv, alpha2))
+            hooks.append(SteerHead(model, t["layer"], t["head"], head_dim, sv, alpha2,
+                                   positions=args.steer_positions))
         info = {
             "method": "E", "alpha1": alpha1, "safety_topk": stk,
             "alpha2": alpha2, "correct_topk": ctk,
@@ -386,6 +400,9 @@ def main():
     parser.add_argument("--do_sample",      action="store_true")
     parser.add_argument("--temperature",    type=float, default=1.0)
     parser.add_argument("--top_p",          type=float, default=1.0)
+    parser.add_argument("--steer_positions", choices=STEER_POSITIONS, default="all",
+                        help="all = every position incl. prompt (original); response = last "
+                             "prompt position + generated tokens, files get a '_resp' suffix")
 
     args = parser.parse_args()
 
