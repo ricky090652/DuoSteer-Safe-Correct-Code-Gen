@@ -47,6 +47,9 @@ SETTINGS AND HOW THE STEERING WORKS
 
     top-k heads are selected by importance to safe code generation
     (see HEAD SELECTION below).  All selected heads share the same α.
+    With --vuln_k_list > 0 (causal results only), the k_vuln most
+    vuln-promoting heads (most positive delta) are added to the target set
+    and get the same α·v with their own vectors; top_k = 0 steers only them.
 
   head_suppress
     Selects top_k heads by |delta_vs_baseline| and splits them 50/50 by
@@ -627,7 +630,9 @@ def make_output_filename(setting: str, args, sv_method: str = "unknown") -> str:
     if setting == "layer":
         return f"layer_L{args.layer_idx:02d}_{sv_method}_alpha{args.alpha:.1f}{tag}.jsonl"
     if setting == "head":
-        return f"head_top{args.top_k}_{sv_method}_alpha{args.alpha:.1f}{tag}.jsonl"
+        vk = getattr(args, "vuln_k", 0)
+        vtag = f"_vuln{vk}" if vk else ""
+        return f"head_top{args.top_k}_{sv_method}_alpha{args.alpha:.1f}{vtag}{tag}.jsonl"
     if setting == "head_suppress":
         half = args.top_k // 2
         return (
@@ -715,7 +720,13 @@ def run_setting(
 
     elif setting == "head":
         ranked_safe, rtype = load_head_results(args.head_results)
+        vuln_k = getattr(args, "vuln_k", 0)
+        if vuln_k and rtype != "causal":
+            raise ValueError("--vuln_k_list > 0 needs head_causal_results.json (delta-ranked).")
         targets = select_safe_heads(ranked_safe, args.top_k)
+        n_safe = len(targets)
+        if vuln_k:
+            targets = targets + select_vuln_heads(ranked_safe, vuln_k)
         raw_norms = []
         for t in targets:
             sv, sv_method, raw_norm = load_head_sv(args.head_steering_dir, t["layer"], t["head"])
@@ -730,6 +741,8 @@ def run_setting(
             "alpha":         args.alpha,
             "mean_raw_norm": mean_raw_norm,
             "targets":       [_head_summary(t, rtype) for t in targets],
+            "vuln_k":        vuln_k,
+            "n_safe_targets": n_safe,
         })
         print(f"  heads=[{', '.join(_head_label(t) for t in targets)}]"
               f"  α={args.alpha}  mean_raw_norm={mean_raw_norm:.5f}"
@@ -885,11 +898,15 @@ def main(args):
         elif setting == "head":
             for top_k in top_ks:
                 for alpha in alphas:
-                    a = copy.copy(args)
-                    a.top_k = top_k
-                    a.alpha = alpha
-                    print(f"\n-- top_k={top_k}  α={alpha} --")
-                    run_setting(setting, items, model, tokenizer, a, output_dir, head_dim)
+                    for vuln_k in args.vuln_k_list:
+                        if not top_k and not vuln_k:
+                            continue
+                        a = copy.copy(args)
+                        a.top_k = top_k
+                        a.alpha = alpha
+                        a.vuln_k = vuln_k
+                        print(f"\n-- top_k={top_k}  vuln_k={vuln_k}  α={alpha} --")
+                        run_setting(setting, items, model, tokenizer, a, output_dir, head_dim)
 
         elif setting == "head_suppress":
             # alpha treated as scale_safe; scale_vuln = -alpha (symmetric)
@@ -1038,8 +1055,10 @@ if __name__ == "__main__":
     parser.add_argument("--beta_list", type=float, nargs="+", default=[0.5],
         help="'head_scale': safe-promoting heads are scaled by (1 + β) (default: 0.5).")
     parser.add_argument("--vuln_k_list", type=int, nargs="+", default=[0],
-        help="'head_scale': number of vuln-promoting heads to attenuate; 0 disables\n"
-             "(default: 0).  Use --top_k_list 0 for attenuation only.")
+        help="Number of vuln-promoting heads (most positive delta) to include; 0 disables\n"
+             "(default: 0).  'head': they get the same α·v with their own vectors.\n"
+             "'head_scale': they are attenuated by (1 − β_vuln).  With --top_k_list 0\n"
+             "only these heads are touched.")
     parser.add_argument("--vuln_beta_list", type=float, nargs="+", default=[0.5],
         help="'head_scale': vuln-promoting heads are scaled by (1 − β_vuln);\n"
              "1.0 = knockout (default: 0.5).")
