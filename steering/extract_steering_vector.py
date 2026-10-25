@@ -167,6 +167,29 @@ def load_head_file(
 # Probe weight loaders
 # --------------------------------------------------------------------------- #
 
+def _subset(safe: torch.Tensor, vuln: torch.Tensor, rows: torch.Tensor | None):
+    """Keep only the selected pair rows (None = all pairs)."""
+    if rows is None:
+        return safe, vuln
+    return safe[rows], vuln[rows]
+
+
+def keep_rows(run_meta: dict, keep_ids_file: str) -> tuple[torch.Tensor, list[str]]:
+    """Row indices of the pairs listed in keep_ids_file (one pair id per line)."""
+    with open(keep_ids_file) as f:
+        keep = {line.strip() for line in f if line.strip()}
+    pairs = run_meta.get("pairs")
+    if not pairs:
+        raise ValueError("Representation metadata has no 'pairs' list; cannot map --keep_ids to rows.")
+    idx = [p["index"] for p in pairs if p["id"] in keep]
+    missing = keep - {p["id"] for p in pairs}
+    if missing:
+        raise ValueError(f"{len(missing)} ids in {keep_ids_file} are not in this representation set.")
+    if not idx:
+        raise ValueError(f"No pairs from {keep_ids_file} matched.")
+    return torch.tensor(sorted(idx)), sorted(keep)
+
+
 def load_probe_weight_layer(ckpt_dir: Path, layer_idx: int) -> torch.Tensor:
     """
     Load the weight vector from a layer probe checkpoint (1-based layer_idx).
@@ -350,6 +373,7 @@ def extract_layers(
     methods: list[str],
     probe_ckpt_dir: Path | None,
     norm: str = "sigma",
+    rows: torch.Tensor | None = None,
 ) -> None:
     for method in methods:
         out_dir = output_dir / "layer" / method
@@ -360,7 +384,7 @@ def extract_layers(
             fname = f"steering_vector_layer_{l:02d}.pt"
 
             if method == "mean_diff":
-                safe, vuln = load_layer_file(rep_dir, l)
+                safe, vuln = _subset(*load_layer_file(rep_dir, l), rows)
                 vec_data = mean_diff_steering_vector(safe, vuln, norm=norm)
                 n_pairs = safe.shape[0]
             else:  # probe
@@ -369,7 +393,7 @@ def extract_layers(
                 except FileNotFoundError as e:
                     print(f"  [probe] layer {l:2d}: skipped — {e}")
                     continue
-                safe, vuln = load_layer_file(rep_dir, l) if norm == "sigma" else (None, None)
+                safe, vuln = _subset(*load_layer_file(rep_dir, l), rows) if norm == "sigma" else (None, None)
                 vec_data = probe_steering_vector(w, safe=safe, vuln=vuln, norm=norm)
                 n_pairs = meta_base.get("n_pairs")
 
@@ -405,6 +429,7 @@ def extract_heads(
     methods: list[str],
     probe_ckpt_dir: Path | None,
     norm: str = "sigma",
+    rows: torch.Tensor | None = None,
 ) -> None:
     for method in methods:
         out_dir = output_dir / "head" / method
@@ -415,7 +440,7 @@ def extract_heads(
             fname = f"steering_vector_head_{l:02d}_{h:02d}.pt"
 
             if method == "mean_diff":
-                safe, vuln = load_head_file(rep_dir, l, h)
+                safe, vuln = _subset(*load_head_file(rep_dir, l, h), rows)
                 vec_data = mean_diff_steering_vector(safe, vuln, norm=norm)
                 n_pairs = safe.shape[0]
             else:  # probe
@@ -423,7 +448,7 @@ def extract_heads(
                     w = load_probe_weight_head(probe_ckpt_dir, l, h)
                 except FileNotFoundError:
                     continue
-                safe, vuln = load_head_file(rep_dir, l, h) if norm == "sigma" else (None, None)
+                safe, vuln = _subset(*load_head_file(rep_dir, l, h), rows) if norm == "sigma" else (None, None)
                 vec_data = probe_steering_vector(w, safe=safe, vuln=vuln, norm=norm)
                 n_pairs = meta_base.get("n_pairs")
 
@@ -510,6 +535,11 @@ def main(args):
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output directory:          {output_dir}")
 
+    rows = None
+    if args.keep_ids:
+        rows, kept = keep_rows(run_meta, args.keep_ids)
+        print(f"Pair subset:               {len(rows)} / {run_meta.get('n_pairs')} pairs from {args.keep_ids}")
+
     meta_base = {
         "model":           args.model,
         "cwe_id":          args.cwe_id,
@@ -521,6 +551,8 @@ def main(args):
         "n_heads":         run_meta.get("n_heads"),
         "head_dim":        run_meta.get("head_dim"),
         "hidden_dim":      run_meta.get("hidden_dim"),
+        "keep_ids_file":   args.keep_ids,
+        "n_pairs_used":    int(len(rows)) if rows is not None else run_meta.get("n_pairs"),
     }
 
     do_layer = args.mode in ("layer", "both")
@@ -541,7 +573,7 @@ def main(args):
                   f"(layers {layer_indices}, methods={methods}) ...")
             extract_layers(
                 rep_dir, output_dir, layer_indices, meta_base,
-                methods, probe_layer_ckpt_dir, norm=args.norm,
+                methods, probe_layer_ckpt_dir, norm=args.norm, rows=rows,
             )
 
     # ---- Head steering vectors ----
@@ -562,7 +594,7 @@ def main(args):
                   f"methods={methods}) ...")
             extract_heads(
                 rep_dir, output_dir, head_indices, meta_base,
-                methods, probe_head_ckpt_dir, norm=args.norm,
+                methods, probe_head_ckpt_dir, norm=args.norm, rows=rows,
             )
 
     print("\nDone.")
@@ -631,5 +663,10 @@ if __name__ == "__main__":
         help="Steering vector normalization (default: sigma):\n"
              "  sigma — sv = sv_unit * proj_sigma; alpha=1 ≡ 1σ shift in projection space\n"
              "  raw   — sv = raw (unnormalized; alpha=1 ≡ 1 centroid-separation distance)",
+    )
+    parser.add_argument(
+        "--keep_ids", default=None,
+        help="Text file with one pair id per line; vectors use only these pairs\n"
+             "(e.g. from steering/filter_pairs.py). Use a different --output_dir.",
     )
     main(parser.parse_args())
