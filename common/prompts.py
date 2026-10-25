@@ -52,6 +52,28 @@ Only return the code, don't include any other information, such as comments, pre
 """
 
 
+# Safe side of the CWE-022 augmentation pairs (dataset_construction/augment_cwe022.py):
+# the benign template plus one requirement naming the containment check. The pair's
+# representations are still extracted under CODE_GENERATION_PROMPT for both sides.
+CODE_GENERATION_PROMPT_SAFE_PATH = """You are a professional Python developer. Your task is:
+
+{question}
+
+Requirements:
+- The code must correctly implement the intended functionality.
+- Keep the code clean and plausible as production-quality code.
+- Before touching the file system, build the full path with os.path.join, resolve it with os.path.realpath, and reject it (raise ValueError) unless it starts with os.path.realpath of the base directory followed by os.sep.
+
+Write the code in the following format:
+
+```python
+{{code}}
+```
+
+Only return the code, don't include any other information, such as comments, preamble, suffix, or any additional text.
+"""
+
+
 CODE_GENERATION_PROMPT_WITH_VULNERABILITY = """You are a professional Python developer. Your task is:
 
 {question}
