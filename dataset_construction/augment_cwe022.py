@@ -5,12 +5,15 @@ The intra-prompt pipeline cannot pair these tasks: under the benign prompt the
 model almost never writes a containment check (EXPERIMENTS §5.24). Here the safe
 side is sampled under CODE_GENERATION_PROMPT_SAFE_PATH (benign template plus a
 requirement naming the os.path.realpath + startswith check) and the vulnerable
-side under the benign prompt. Representations are later extracted with the
+side under the benign prompt. --safe_template path_spec uses the minimal-edit
+variant for SecCodePLT-style questions (keeps the template's Path return type
+and exceptions). Representations are later extracted with the
 benign prompt for both sides, so the prompt text itself does not enter them.
 
   prepare  write the two generation inputs (each question repeated N times)
   build    after generation + CodeQL, pair CodeQL-clean safe samples with
-           CodeQL-flagged benign samples and append them to the CWE's intra pairs
+           CodeQL-flagged benign samples; append them to the CWE's intra pairs
+           (--base_pairs) or write only the new pairs
 
 Example:
   python dataset_construction/augment_cwe022.py prepare --questions data/augment/cwe022_pathlib_questions.jsonl
@@ -40,7 +43,11 @@ import tokenize
 from collections import defaultdict
 from pathlib import Path
 
-from prompts import CODE_GENERATION_PROMPT, CODE_GENERATION_PROMPT_SAFE_PATH
+from prompts import (CODE_GENERATION_PROMPT, CODE_GENERATION_PROMPT_SAFE_PATH,
+                     CODE_GENERATION_PROMPT_SAFE_PATH_SPEC)
+
+SAFE_TEMPLATES = {"path": "CODE_GENERATION_PROMPT_SAFE_PATH",
+                  "path_spec": "CODE_GENERATION_PROMPT_SAFE_PATH_SPEC"}
 
 FENCE_RE = re.compile(r"```(?:python)?\s*\n?(.*?)\n?```", re.DOTALL)
 CHECK_RE = re.compile(r"os\.path\.(realpath|normpath)")
@@ -83,7 +90,7 @@ def cmd_prepare(args):
             for j in range(args.n):
                 rid = f"{q['id']}__gen{j}"
                 fv.write(json.dumps({**q, "id": rid}) + "\n")
-                msg = CODE_GENERATION_PROMPT_SAFE_PATH.format(question=q["question"])
+                msg = globals()[SAFE_TEMPLATES[args.safe_template]].format(question=q["question"])
                 fs.write(json.dumps({**q, "id": rid, "messages": [{"role": "user", "content": msg}]}) + "\n")
     print(f"{len(qs)} questions x {args.n} -> {out}/{stem}_x{args.n}_{{vuln,safe}}.jsonl")
 
@@ -117,8 +124,10 @@ def cmd_build(args):
                 cand[qid]["safe"].setdefault(code, (r, det))
             else:
                 stats[qid][f"{side}_rejected"] += 1
-    base = [json.loads(l) for l in open(args.base_pairs) if l.strip()]
-    base = [p for p in base if p["cwe_id"] == args.cwe]
+    base = []
+    if args.base_pairs:
+        base = [json.loads(l) for l in open(args.base_pairs) if l.strip()]
+        base = [p for p in base if p["cwe_id"] == args.cwe]
     new, k = [], 0
     for qid in sorted(cand):
         safes, vulns = list(cand[qid]["safe"].items()), list(cand[qid]["vuln"].items())
@@ -127,10 +136,10 @@ def cmd_build(args):
             (s_code, (s_rec, _)), (v_code, (v_rec, v_det)) = safes[i % len(safes)], vulns[i % len(vulns)]
             k += 1
             new.append({
-                "id": f"codesec-qwen25-aug{args.cwe}-{k:04d}", "cwe_id": args.cwe,
-                "question": s_rec["question"], "source": "augment-pathlib",
+                "id": f"codesec-qwen25-{args.tag}{args.cwe}-{k:04d}", "cwe_id": args.cwe,
+                "question": s_rec["question"], "source": f"augment-{args.tag}",
                 "prompt": CODE_GENERATION_PROMPT.format(question=s_rec["question"]),
-                "safe_prompt": "CODE_GENERATION_PROMPT_SAFE_PATH",
+                "safe_prompt": SAFE_TEMPLATES[args.safe_template],
                 "safe_code": f"```python\n{s_code}\n```", "vuln_code": f"```python\n{v_code}\n```",
                 "vuln_codeql_detections": v_det,
             })
@@ -151,13 +160,18 @@ if __name__ == "__main__":
     p.add_argument("--questions", required=True)
     p.add_argument("--n", type=int, default=10)
     p.add_argument("--out_dir", default="data/augment")
+    p.add_argument("--safe_template", choices=sorted(SAFE_TEMPLATES), default="path")
     b = sub.add_parser("build")
     b.add_argument("--vuln_gen", required=True)
     b.add_argument("--safe_gen", required=True)
     b.add_argument("--vuln_mode", default="aug_vuln")
     b.add_argument("--safe_mode", default="aug_safe")
     b.add_argument("--codeql_issues", required=True)
-    b.add_argument("--base_pairs", required=True)
+    b.add_argument("--base_pairs", default=None,
+                   help="Intra pairs to prepend (same CWE); omit to write only the new pairs")
+    b.add_argument("--safe_template", choices=sorted(SAFE_TEMPLATES), default="path",
+                   help="Template used in prepare (recorded in each pair's safe_prompt)")
+    b.add_argument("--tag", default="aug", help="Pair id / source tag, e.g. aug or augspec")
     b.add_argument("--cwe", default="022")
     b.add_argument("--max_per_question", type=int, default=5)
     b.add_argument("--out", required=True)
