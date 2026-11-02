@@ -54,6 +54,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent))
 from steer_eval import (
     STEER_POSITIONS, SteerHead, load_head_sv, load_head_results, select_safe_heads,
+    select_vuln_heads,
     build_prompt, generate_one, get_head_config, load_model,
 )
 
@@ -64,9 +65,10 @@ from steer_eval import (
 
 def make_filename(method: str, alpha1: float, stk: int,
                   alpha2: float, ctk: int, alpha: float, tk: int,
-                  jtk: int = 0) -> str:
+                  jtk: int = 0, svk: int = 0) -> str:
+    sv = f"_svuln{svk}" if svk else ""
     if method == "A":
-        return f"A_s{alpha1:.1f}_stk{stk}_c{alpha2:.1f}_ctk{ctk}.jsonl"
+        return f"A_s{alpha1:.1f}_stk{stk}{sv}_c{alpha2:.1f}_ctk{ctk}.jsonl"
     if method == "B":
         return f"B_s{alpha1:.1f}_c{alpha2:.1f}_jtk{jtk}.jsonl"
     if method == "C":
@@ -74,8 +76,17 @@ def make_filename(method: str, alpha1: float, stk: int,
     if method == "D":
         return f"D_a{alpha:.1f}_tk{tk}.jsonl"
     if method == "E":
-        return f"E_s{alpha1:.1f}_stk{stk}_c{alpha2:.1f}_ctk{ctk}.jsonl"
+        return f"E_s{alpha1:.1f}_stk{stk}{sv}_c{alpha2:.1f}_ctk{ctk}.jsonl"
     raise ValueError(f"Unknown method: {method!r}")
+
+
+def select_safety_targets(safety_ranked, stk, args):
+    """Top-stk safe-promoting heads, plus (--safety_vuln_k) the most vuln-promoting
+    heads; all of them get the same safety vector (steer_eval --vuln_k_list)."""
+    targets = select_safe_heads(safety_ranked, stk)
+    if args.safety_vuln_k:
+        targets = targets + select_vuln_heads(safety_ranked, args.safety_vuln_k)
+    return targets
 
 
 # --------------------------------------------------------------------------- #
@@ -141,16 +152,18 @@ def run_baseline(items, model, tokenizer, output_dir, args):
 
 def run_safety_only(items, model, tokenizer, output_dir, args,
                     safety_ranked, head_dim, alpha1, stk):
-    fname = f"safety_only_stk{stk}_a{alpha1:.1f}.jsonl"
+    svk = args.safety_vuln_k
+    fname = f"safety_only_stk{stk}{f'_svuln{svk}' if svk else ''}_a{alpha1:.1f}.jsonl"
 
     def mk():
-        targets = select_safe_heads(safety_ranked, stk)
+        targets = select_safety_targets(safety_ranked, stk, args)
         hooks = []
         for t in targets:
             sv, _, _ = load_head_sv(args.safety_sv_dir, t["layer"], t["head"])
             hooks.append(SteerHead(model, t["layer"], t["head"], head_dim, sv, alpha1,
                                    positions=args.steer_positions))
-        info = {"method": "safety_only", "alpha1": alpha1, "safety_topk": stk}
+        info = {"method": "safety_only", "alpha1": alpha1, "safety_topk": stk,
+                "safety_vuln_k": svk}
         return hooks, info
 
     run_condition(items, model, tokenizer, mk, output_dir / fname, args)
@@ -163,10 +176,10 @@ def run_safety_only(items, model, tokenizer, output_dir, args,
 def run_method_A(items, model, tokenizer, output_dir, args,
                  safety_ranked, correct_ranked, head_dim,
                  alpha1, stk, alpha2, ctk):
-    fname = make_filename("A", alpha1, stk, alpha2, ctk, 0, 0)
+    fname = make_filename("A", alpha1, stk, alpha2, ctk, 0, 0, svk=args.safety_vuln_k)
 
     def mk():
-        safety_targets  = select_safe_heads(safety_ranked, stk)
+        safety_targets  = select_safety_targets(safety_ranked, stk, args)
         correct_targets = select_safe_heads(correct_ranked, ctk)
         hooks = []
         for t in safety_targets:
@@ -179,6 +192,7 @@ def run_method_A(items, model, tokenizer, output_dir, args,
                                    positions=args.steer_positions))
         info = {
             "method": "A", "alpha1": alpha1, "safety_topk": stk,
+            "safety_vuln_k": args.safety_vuln_k,
             "alpha2": alpha2, "correct_topk": ctk,
         }
         return hooks, info
@@ -316,10 +330,10 @@ def run_method_E(items, model, tokenizer, output_dir, args,
     it should not encode the same directional safety signal as v_s.
     If Gram-Schmidt orthogonalization is unnecessary, Method E ≈ Method A.
     """
-    fname = make_filename("E", alpha1, stk, alpha2, ctk, 0, 0)
+    fname = make_filename("E", alpha1, stk, alpha2, ctk, 0, 0, svk=args.safety_vuln_k)
 
     def mk():
-        safety_targets  = select_safe_heads(safety_ranked, stk)
+        safety_targets  = select_safety_targets(safety_ranked, stk, args)
         correct_targets = select_safe_heads(correct_ranked, ctk)
         hooks = []
         for t in safety_targets:
@@ -332,6 +346,7 @@ def run_method_E(items, model, tokenizer, output_dir, args,
                                    positions=args.steer_positions))
         info = {
             "method": "E", "alpha1": alpha1, "safety_topk": stk,
+            "safety_vuln_k": args.safety_vuln_k,
             "alpha2": alpha2, "correct_topk": ctk,
             "note": "raw (non-orth) correctness vector",
         }
@@ -385,6 +400,11 @@ def main():
                         help="Override correctness top-k (A/C/E); defaults to --topk_list")
     parser.add_argument("--joint_topk_list",  type=int,   nargs="+", default=None,
                         help="Joint top-k values for Method B; defaults to --topk_list")
+
+    parser.add_argument("--safety_vuln_k", type=int, default=0,
+                        help="Methods A/E and safety-only: also add the safety vector at the "
+                             "k most vuln-promoting heads (as steer_eval --vuln_k_list); "
+                             "files get '_svuln{k}'")
 
     parser.add_argument("--skip_baseline", action="store_true",
                         help="Do not run the unsteered baseline condition")
