@@ -181,11 +181,15 @@ def cmd_collect(args):
     state["status"] = batch.status
     with open(state_path, "w") as f:
         json.dump(state, f, indent=2)
-    if batch.status != "completed":
+    # A cancelled or expired batch still returns the requests it finished.
+    if batch.status not in ("completed", "cancelled", "expired"):
         return
     if batch.output_file_id is None:
         print("no output file")
         return
+    if batch.status != "completed":
+        missing = batch.request_counts.total - batch.request_counts.completed
+        print(f"WARNING: batch {batch.status}, labeling the partial output ({missing} requests missing)")
 
     raw_bytes = client.files.content(batch.output_file_id).content
     lines = raw_bytes.decode().strip().split("\n")
@@ -253,19 +257,32 @@ def cmd_collect(args):
     print(f"wrote {rates_path}")
 
 
+def cmd_cancel(args):
+    """Cancel a batch stuck on its last requests; collect then labels what finished."""
+    from openai import OpenAI
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    state_path = Path(args.out_dir) / "batch_state.json"
+    if not state_path.exists():
+        raise SystemExit("no batch_state.json — submit first")
+    state = json.load(open(state_path))
+    batch = client.batches.cancel(state["batch_id"])
+    print(f"batch_id={batch.id}  status={batch.status}  (run collect once it is 'cancelled')")
+
+
 def main():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("prepare", "submit", "collect"):
+    for name in ("prepare", "submit", "collect", "cancel"):
         sp = sub.add_parser(name)
         sp.add_argument("--out_dir", required=True)
-        if name != "submit":
+        if name not in ("submit", "cancel"):
             sp.add_argument("--steer_base", required=True)
             sp.add_argument("--modes", nargs="+", default=["safety_only", "double_A"])
             sp.add_argument("--cwes", nargs="+", default=CWES, choices=CWES,
                             help="Only these CWEs (default: all five)")
     args = p.parse_args()
-    {"prepare": cmd_prepare, "submit": cmd_submit, "collect": cmd_collect}[args.cmd](args)
+    {"prepare": cmd_prepare, "submit": cmd_submit, "collect": cmd_collect,
+     "cancel": cmd_cancel}[args.cmd](args)
 
 
 if __name__ == "__main__":

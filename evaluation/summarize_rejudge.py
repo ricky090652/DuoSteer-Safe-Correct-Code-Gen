@@ -56,15 +56,20 @@ def main():
         ids = set().union(*per_run)
         n = len(ids)
         v = codeql_rates.get(cwe, {}).get(mode, {}).get(cond)
-        if v is None or any(len(p) != n for p in per_run):
-            print(f"{cond:<24} skipped (missing CodeQL result or judge run)")
+        if v is None:
+            print(f"{cond:<24} skipped (no CodeQL result)")
             continue
         V = v["n_vuln"] / n
-        C_runs = [sum(p.values()) / n for p in per_run]
-        C_maj = sum(2 * sum(p[i] for p in per_run) > len(runs) for i in ids) / n
+        # An item missing from a run (e.g. a cancelled batch) is decided by the
+        # runs that judged it; a tie counts as incorrect.
+        votes = [[p[i] for p in per_run if i in p] for i in ids]
+        C_maj = sum(2 * sum(vs) > len(vs) for vs in votes) / n
+        C_runs = [sum(p.values()) / len(p) if p else float("nan") for p in per_run]
         joint_mean = sum(c * (1 - V) for c in C_runs) / len(C_runs)
+        missing = sum(n - len(p) for p in per_run)
+        note = f"  ({missing} missing judgments)" if missing else ""
         print(f"{cond:<24} {100*V:6.1f} {100*C_maj:6.1f} {100*C_maj*(1-V):6.1f} | "
-              f"{' '.join(f'{100*c:5.1f}' for c in C_runs):<24} {100*joint_mean:10.1f}")
+              f"{' '.join(f'{100*c:5.1f}' for c in C_runs):<24} {100*joint_mean:10.1f}{note}")
 
 
 if __name__ == "__main__":
