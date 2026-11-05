@@ -276,17 +276,26 @@ def mean_diff_steering_vector(
     raw       = safe_mean - vuln_mean
     raw_norm  = raw.norm().item()
     sv_unit   = raw / raw_norm
+    md_unit   = sv_unit
+
+    if norm == "sigma_elem":
+        # Paper Eq.3 read literally: divide each component by its own std over safe ∪ vuln.
+        # This changes the direction; the length is then matched to the "sigma" option
+        # (alpha=1 ≡ 1σ along the new direction) so only the direction differs.
+        comp_std = torch.cat([safe, vuln], dim=0).float().std(dim=0).clamp_min(1e-6)
+        d = raw.float() / comp_std
+        sv_unit = (d / d.norm()).to(raw.dtype)
 
     sigma = _proj_sigma(safe, vuln, sv_unit)
 
-    if norm == "sigma":
+    if norm in ("sigma", "sigma_elem"):
         # sv = sv_unit * sigma so that h' = h + alpha*sv shifts projection by alpha*sigma = alpha σ
         # alpha=1 ≡ exactly 1σ shift toward safe; comparable across layers, heads, CWEs
         sv = sv_unit * sigma
     elif norm == "raw":
         sv = raw              # alpha=1 ↔ 1 centroid-sep distance
     else:
-        raise ValueError(f"Unknown norm: {norm!r}  (choices: sigma, raw)")
+        raise ValueError(f"Unknown norm: {norm!r}  (choices: sigma, sigma_elem, raw)")
 
     return {
         "steering_vector": sv,
@@ -295,6 +304,7 @@ def mean_diff_steering_vector(
         "vuln_mean":        vuln_mean,
         "raw_norm":         raw_norm,
         "proj_sigma":       sigma,
+        "cos_to_md":        torch.dot(sv_unit.float(), md_unit.float()).item(),
         "norm":             norm,
         "method":           "mean_diff",
     }
@@ -313,6 +323,8 @@ def probe_steering_vector(
     safe, vuln    : activations needed when norm="sigma"; ignored for "raw"
     norm          : "sigma" | "raw"
     """
+    if norm == "sigma_elem":
+        raise ValueError("norm='sigma_elem' is only implemented for method mean_diff")
     raw_norm = w_toward_safe.norm().item()
     sv_unit  = w_toward_safe / raw_norm
 
@@ -462,9 +474,14 @@ def extract_heads(
                 "n_pairs":    n_pairs,
                 "raw_norm":   vec_data["raw_norm"],
                 "proj_sigma": vec_data["proj_sigma"],
+                "cos_to_md":  vec_data.get("cos_to_md"),
                 "norm":       norm,
             })
 
+        if norm == "sigma_elem":
+            cs = [m["cos_to_md"] for m in results_meta]
+            print(f"  cos(sigma_elem direction, MD direction): mean {sum(cs)/len(cs):.3f}, "
+                  f"min {min(cs):.3f}, max {max(cs):.3f}")
         meta = {**meta_base, "mode": "head", "method": method, "norm": norm,
                 "heads": results_meta}
         with open(out_dir / "metadata.json", "w") as f:
@@ -659,9 +676,11 @@ if __name__ == "__main__":
         help="1-based head index (requires --layer_idx). If omitted, process all heads.",
     )
     parser.add_argument(
-        "--norm", default="sigma", choices=["sigma", "raw"],
+        "--norm", default="sigma", choices=["sigma", "sigma_elem", "raw"],
         help="Steering vector normalization (default: sigma):\n"
              "  sigma — sv = sv_unit * proj_sigma; alpha=1 ≡ 1σ shift in projection space\n"
+             "  sigma_elem — direction = unit(raw / per-component std) (paper Eq.3 read literally),\n"
+             "               length as in sigma; mean_diff only. Use a different --output_dir.\n"
              "  raw   — sv = raw (unnormalized; alpha=1 ≡ 1 centroid-separation distance)",
     )
     parser.add_argument(
