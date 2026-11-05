@@ -21,7 +21,8 @@ Outputs saved to {output_dir}/:
       val_curves.png          — val accuracy over epochs, one line per layer
       best_per_layer.png      — best val accuracy across all layers
     [head mode]
-      head_heatmap.png        — heatmap of best val accuracy (layers × heads)
+      head_heatmap.png        — per-head val accuracy at real (layer, head) positions
+                                (redraw from JSON: plot_probe_heatmaps.py)
 
 Usage:
   # Layer-level probes
@@ -271,61 +272,22 @@ def plot_head_heatmap(
     out_path: Path,
 ) -> None:
     """
-    Heatmap of best probe accuracy.
-      y-axis — layer number, layer 1 at bottom, highest layer at top
-      x-axis — head rank within that layer (0 = highest accuracy, sorted independently per layer)
-
-    Blues colormap: dark = high accuracy, light = low.
-    No per-cell annotations since heads are already sorted by rank.
+    Paper Figure 1 style heatmap: each head at its real (layer, head) position
+    (not sorted), layer 1 at the bottom, RdYlGn on a fixed 55–85% scale, best
+    head boxed. Adds the layer-level strip if layer_accuracy_results.json
+    already exists in the same plots/ dir (i.e. layer mode was run first).
+    To redraw from saved JSON without retraining, use plot_probe_heatmaps.py.
     """
-    n_layers, n_heads = acc_matrix.shape   # n_layers rows = layers 1..n_layers
+    from matplotlib.colors import Normalize
+    from plot_probe_heatmaps import load_layer_vector, plot_single
 
-    # For each layer (row), sort heads by accuracy descending
-    sorted_acc = np.zeros_like(acc_matrix)
-    for l in range(n_layers):
-        order = np.argsort(acc_matrix[l])[::-1]
-        sorted_acc[l] = acc_matrix[l, order]
-
-    # Flip vertically so layer 1 is at the bottom
-    display = sorted_acc[::-1]
-
-    vmin = max(0.4, sorted_acc.min() - 0.02)
-    vmax = min(1.0, sorted_acc.max() + 0.02)
-
-    fig_w = max(10, n_heads  * 0.45)
-    fig_h = max(6,  n_layers * 0.35)
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-
-    im = ax.imshow(
-        display,
-        cmap="Blues",
-        vmin=vmin,
-        vmax=vmax,
-        aspect="auto",
-    )
-
-    cbar = plt.colorbar(im, ax=ax, fraction=0.02, pad=0.02)
-    cbar.set_label("Best Validation Accuracy", fontsize=10)
-
-    ax.set_xlabel("Head rank within layer  (0 = best)", fontsize=11)
-    ax.set_ylabel("Layer", fontsize=11)
-    ax.set_title(
-        "Probe accuracy per layer × head\n"
-        "(heads sorted high → low within each layer)",
-        fontsize=12,
-    )
-
-    ax.set_xticks(np.arange(n_heads))
-    ax.set_xticklabels([str(r) for r in range(n_heads)], fontsize=7)
-
-    # y-ticks: display row 0 = highest layer, display row n_layers-1 = layer 1
-    ax.set_yticks(np.arange(n_layers))
-    ax.set_yticklabels([str(n_layers - l) for l in range(n_layers)], fontsize=7)
-
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved → {out_path}")
+    n_layers = acc_matrix.shape[0]
+    l, h = np.unravel_index(np.argmax(acc_matrix), acc_matrix.shape)
+    layer_vec, best_layer = load_layer_vector(
+        out_path.parent / "layer_accuracy_results.json", n_layers)
+    plot_single(acc_matrix, (int(l) + 1, int(h) + 1), layer_vec, best_layer,
+                Normalize(vmin=55.0, vmax=85.0), plt.get_cmap("RdYlGn"),
+                "", out_path)
 
 
 # --------------------------------------------------------------------------- #
