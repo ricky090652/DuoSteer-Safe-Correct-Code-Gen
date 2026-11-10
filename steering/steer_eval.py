@@ -225,6 +225,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import importlib
 import json
 import sys
 from pathlib import Path
@@ -539,7 +540,7 @@ def _head_summary(h: dict, results_type: str) -> dict:
 # Model loading
 # --------------------------------------------------------------------------- #
 
-def load_model(model_name: str, dtype_str: str, device: str):
+def load_model(model_name: str, dtype_str: str, device: str, adapter: str = None):
     dtype_map = {
         "float32":  torch.float32,
         "float16":  torch.float16,
@@ -554,9 +555,20 @@ def load_model(model_name: str, dtype_str: str, device: str):
         model_kwargs["device_map"] = "auto"
 
     model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
-    model.eval()
     if device not in ("auto", "cpu") and not hasattr(model, "hf_device_map"):
         model = model.to(device)
+    if adapter:
+        # Merge a fine-tuned LoRA adapter (finetune/train_dpo_lora.py) into the base
+        # weights, so generation and all hook-based settings run on a plain model.
+        try:
+            # Needed by some peft builds; importlib avoids rebinding `torch` as a local.
+            importlib.import_module("torch.distributed.tensor")
+        except Exception:
+            pass
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, adapter).merge_and_unload()
+        print(f"  merged adapter: {adapter}")
+    model.eval()
     return model, tokenizer
 
 
@@ -876,7 +888,7 @@ def main(args):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\nLoading {args.model!r} ...")
-    model, tokenizer = load_model(args.model, args.dtype, args.device)
+    model, tokenizer = load_model(args.model, args.dtype, args.device, args.adapter)
     _, head_dim = get_head_config(model)
     print(f"  head_dim={head_dim}")
 
@@ -971,6 +983,9 @@ if __name__ == "__main__":
     # Model
     parser.add_argument("--model", required=True,
         help="HuggingFace model name or local path.")
+    parser.add_argument("--adapter", default=None,
+        help="Optional PEFT (LoRA) adapter dir merged into --model before generation\n"
+             "(e.g. a finetune/train_dpo_lora.py checkpoint).")
     parser.add_argument("--dtype", default="bfloat16",
         choices=["float32", "float16", "bfloat16"],
         help="Model dtype (default: bfloat16).")

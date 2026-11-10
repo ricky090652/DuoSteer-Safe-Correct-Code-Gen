@@ -1,4 +1,4 @@
-# Core (representation extraction, probing, causal analysis, steering, SFT)
+# Core (representation extraction, probing, causal analysis, steering)
 torch>=2.1
 transformers>=4.43
 accelerate>=0.30
@@ -11,3 +11,9 @@ openai>=1.30
 # SecCodePLT unit-test evaluation (parquet loading)
 pandas>=2.0
 pyarrow>=14.0
+
+# DPO + LoRA baseline (finetune/). Install in the existing container with transformers
+# pinned to the installed version, so pip does not upgrade it (see finetune/README.md).
+peft>=0.12
+trl>=0.11
+datasets>=2.20
